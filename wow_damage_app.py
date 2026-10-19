@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
 r"""
-WoW Damage Parser — статистика урона из combat log.
+WoW Damage Parser — статистика заходов из combat log.
 
-Читает Logs\WoWCombatLog.txt (World of Warcraft), находит заходы в подземелья
-и считает нанесённый урон, DPS и распределение по способностям.
+Читает Logs\WoWCombatLog.txt (World of Warcraft), находит заходы в подземелья,
+считает урон, исцеление, прерывания и смерти по каждому игроку группы,
+определяет уровень ключа, время прохождения и бонус (+1/+2/+3).
+
+При включённом расширенном логировании (`/console advancedCombatLogging 1`)
+дополнительно читает COMBATANT_INFO: класс, специализацию, уровень предметов
+и характеристики каждого персонажа.
 
 Запуск GUI:        python wow_damage_app.py
 Запуск из консоли: python wow_damage_app.py --cli "путь\к\WoWCombatLog.txt" [--player Имя]
@@ -11,13 +16,13 @@ WoW Damage Parser — статистика урона из combat log.
 from __future__ import annotations
 
 import argparse
-import csv
 import re
-import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from classes import SPECS, class_by_spec, dungeon_timer, guess_class
 
 # ----------------------------------------------------------------------------
 # Константы
@@ -31,23 +36,18 @@ DAMAGE_EVENTS = {
     "DAMAGE_SHIELD",
     "DAMAGE_SPLIT",
 }
-
-# события, по которым определяем формат лога (у них первый аргумент — GUID источника)
-GUID_EVENTS = DAMAGE_EVENTS | {
-    "SWING_MISSED", "SPELL_MISSED", "SPELL_PERIODIC_MISSED", "RANGE_MISSED",
-    "SPELL_HEAL", "SPELL_PERIODIC_HEAL", "SPELL_SUMMON", "SPELL_CAST_SUCCESS",
-    "SPELL_AURA_APPLIED", "UNIT_DIED", "PARTY_KILL",
-}
-
-ADVANCED_PREFIX = re.compile(r"^(Player|Creature|Pet|Vehicle|GameObject|Vignette|Item)-")
-HEX_GUID = re.compile(r"^[0-9A-F]{16}$")
+HEAL_EVENTS = {"SPELL_HEAL", "SPELL_PERIODIC_HEAL"}
 
 DEFAULT_LOG_PATHS = [
     r"C:\Firestorm\Battle for Azeroth Reforged\Logs\WoWCombatLog.txt",
 ]
 
-# события, где нет названия способности (только белая атака)
-MELEE_EVENTS = {"SWING_DAMAGE", "DAMAGE_SHIELD"}
+GUID_RE = re.compile(r"^([A-Z][a-z]+-\d+-[0-9A-F]+|[0-9A-F]{16})$")
+HEX_GUID_RE = re.compile(r"^[0-9A-F]{16}$")
+TIME_RE = re.compile(r"^(\d+)/(\d+)\s+(\d+):(\d+):(\d+)\.(\d+)")
+GEAR_ITEM_RE = re.compile(r"\((\d+),(\d+),")
+NIL_GUIDS = {"", "0000000000000000", "0", "nil"}
+SPEC_IDS = set(SPECS.keys())
 
 
 # ----------------------------------------------------------------------------
@@ -63,140 +63,232 @@ class AbilityStat:
 
 
 @dataclass
+class CombatantInfo:
+    guid: str
+    spec_id: int = 0
+    cls: str = ""
+    spec: str = ""
+    strength: int = 0
+    agility: int = 0
+    stamina: int = 0
+    intellect: int = 0
+    armor: int = 0
+    crit: int = 0
+    haste: int = 0
+    mastery: int = 0
+    versatility: int = 0
+    ilvl: float = 0.0
+
+    @property
+    def has_stats(self) -> bool:
+        return bool(self.strength or self.agility or self.stamina or self.intellect)
+
+
+@dataclass
+class PlayerRun:
+    guid: str
+    name: str
+    damage: int = 0
+    healing: int = 0
+    interrupts: int = 0
+    deaths: int = 0
+    active: set = field(default_factory=set)
+    abilities: dict = field(default_factory=dict)
+    spell_ids: dict = field(default_factory=dict)
+    cls: str = ""
+    spec: str = ""
+    info: CombatantInfo | None = None
+
+    @property
+    def dps(self) -> float:
+        return self.damage / len(self.active) if self.active else 0.0
+
+    @property
+    def hps(self) -> float:
+        return self.healing / len(self.active) if self.active else 0.0
+
+
+@dataclass
 class Run:
-    """Один заход (непрерывное пребывание в одной зоне)."""
     zone: str
+    instance_id: int = 0
     start: datetime | None = None
     end: datetime | None = None
-    damage: int = 0
-    hits: int = 0
-    active_seconds: set = field(default_factory=set)
-    abilities: dict = field(default_factory=dict)
-    total_group_damage: int = 0
+    key_level: int | None = None
+    key_success: bool | None = None
+    key_time_ms: int | None = None
+    timer_limit: int | None = None
+    group_size: int = 0
+    boss_kills: int = 0
+    players: dict = field(default_factory=dict)
 
     @property
     def duration(self) -> timedelta:
+        if self.key_time_ms:
+            return timedelta(milliseconds=self.key_time_ms)
         if self.start and self.end:
             return self.end - self.start
         return timedelta(0)
 
     @property
-    def active_time(self) -> float:
-        return float(len(self.active_seconds))
+    def total_damage(self) -> int:
+        return sum(p.damage for p in self.players.values())
 
     @property
-    def dps(self) -> float:
-        t = self.active_time
-        return self.damage / t if t > 0 else 0.0
+    def total_healing(self) -> int:
+        return sum(p.healing for p in self.players.values())
 
     @property
-    def share(self) -> float:
-        return 100.0 * self.damage / self.total_group_damage if self.total_group_damage else 0.0
+    def bonus(self) -> str:
+        """+1 / +2 / +3 / провал / —"""
+        if self.key_level is None:
+            return ""
+        if self.key_success is False:
+            return "провал"
+        if not self.timer_limit or not self.key_time_ms:
+            return "—"
+        limit_ms = self.timer_limit * 1000
+        if self.key_time_ms <= limit_ms * 0.6:
+            return "+3"
+        if self.key_time_ms <= limit_ms * 0.8:
+            return "+2"
+        if self.key_time_ms <= limit_ms:
+            return "+1"
+        return "провал"
+
+    @property
+    def is_dungeon(self) -> bool:
+        return bool(self.key_level) or bool(self.players and self.total_damage > 0)
 
 
 @dataclass
 class ParseResult:
+    runs: list = field(default_factory=list)
+    players: dict = field(default_factory=dict)      # guid -> name
+    combatants: dict = field(default_factory=dict)   # guid -> CombatantInfo
+    advanced: bool = False
+    has_combatant_info: bool = False
+    lines_total: int = 0
     player_guid: str = ""
     player_name: str = ""
-    advanced: bool = False
-    runs: list = field(default_factory=list)
-    players: dict = field(default_factory=dict)   # guid -> name
-    pets_of: dict = field(default_factory=dict)   # pet guid -> owner guid
-    lines_total: int = 0
-    lines_parsed: int = 0
 
 
 # ----------------------------------------------------------------------------
-# Утилиты разбора
+# Утилиты
 # ----------------------------------------------------------------------------
-TIME_RE = re.compile(r"^(\d+)/(\d+)\s+(\d+):(\d+):(\d+)\.(\d+)")
-
-
-def split_csv(line: str) -> list:
-    """Разбивает строку лога по запятым, учитывая кавычки."""
-    fields: list = []
-    buf: list = []
-    in_quotes = False
-    for c in line:
-        if c == '"':
-            in_quotes = not in_quotes
-        elif c == "," and not in_quotes:
-            fields.append("".join(buf))
+def split_fields(s: str) -> list[str]:
+    """Разбивает строку по запятым верхнего уровня (учитывая кавычки, () и [])."""
+    out: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quoted = False
+    for ch in s:
+        if ch == '"':
+            quoted = not quoted
+            buf.append(ch)
+            continue
+        if quoted:
+            buf.append(ch)
+            continue
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(buf))
             buf = []
         else:
-            buf.append(c)
-    fields.append("".join(buf))
-    return fields
+            buf.append(ch)
+    out.append("".join(buf))
+    return out
 
 
-def parse_time(match: re.Match) -> datetime:
-    month, day, hh, mm, ss, ms = (int(x) for x in match.groups())
-    return datetime(2000, month, day, hh, mm, ss) + timedelta(milliseconds=ms)
+def parse_time(m: re.Match, year: int = 2000) -> datetime:
+    month, day, hh, mm, ss, ms = (int(x) for x in m.groups())
+    return datetime(year, month, day, hh, mm, ss) + timedelta(milliseconds=ms)
+
+
+def is_guid(value: str) -> bool:
+    return bool(value) and bool(GUID_RE.match(value)) and value not in NIL_GUIDS
+
+
+def looks_like_guid(value: str) -> bool:
+    """GUID в любом виде, включая нулевой 0000000000000000."""
+    return bool(value) and bool(GUID_RE.match(value))
 
 
 def clean_name(name: str) -> str:
     if not name:
         return name
-    # "Имя-Сервер" -> "Имя" (осторожно с именами вида "Y'sera")
+    name = name.strip('"')
     if "-" in name and not name.startswith("0x"):
         head, _, tail = name.partition("-")
-        if head and head[0].isupper() and tail and all(ch.isalnum() or ch == "-" for ch in tail):
+        if head and head[0].isupper() and tail and all(c.isalnum() or c == "-" for c in tail):
             return head
     return name
 
 
-def to_int(value: str) -> int:
+def to_int(value: str, default: int = 0) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
-        return 0
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
 
 
 # ----------------------------------------------------------------------------
 # Парсер
 # ----------------------------------------------------------------------------
-class _RawSource:
-    __slots__ = ("name", "damage", "hits", "active", "abilities")
-
-    def __init__(self, name: str):
-        self.name = name
-        self.damage = 0
-        self.hits = 0
-        self.active = set()
-        self.abilities: dict = {}
-
-
-class _RawRun:
-    __slots__ = ("zone", "start", "end", "sources", "group_damage")
-
-    def __init__(self, zone: str, start: datetime | None):
-        self.zone = zone
-        self.start = start
-        self.end = start
-        self.sources: dict = {}
-        self.group_damage = 0
-
-
 class CombatLogParser:
-    def __init__(self, player_filter: str | None = None, include_pets: bool = True,
-                 progress_cb=None):
-        self.player_filter = (player_filter or "").strip().lower()
-        self.include_pets = include_pets
+    def __init__(self, progress_cb=None):
         self.progress_cb = progress_cb
-        self.advanced: bool | None = None
 
-    # ------------------------------------------------------------------
     def parse(self, path: str | Path) -> ParseResult:
         path = Path(path)
-        size = path.stat().st_size
+        size = max(1, path.stat().st_size)
         res = ParseResult()
-        raw_runs: list = []
-        current: _RawRun | None = None
-        current_zone = ""
 
-        def close_current():
-            if current is not None:
-                raw_runs.append(current)
+        runs: list[Run] = []
+        names: dict[str, str] = {}
+        pets_of: dict[str, str] = {}
+        cur: Run | None = None
+        cur_zone = ""
+
+        # Год в combat log не пишется — восстанавливаем по дате файла
+        mtime = datetime.fromtimestamp(path.stat().st_mtime)
+        year_state = {"year": mtime.year, "prev_month": 0}
+
+        def timestamp(m: re.Match) -> datetime:
+            month = int(m.group(1))
+            if year_state["prev_month"] and month < year_state["prev_month"] - 6:
+                year_state["year"] += 1  # переход через Новый год
+            dt = parse_time(m, year_state["year"])
+            if not year_state["prev_month"] and dt > mtime + timedelta(days=2):
+                year_state["year"] -= 1  # лог за прошлый год
+                dt = parse_time(m, year_state["year"])
+            year_state["prev_month"] = month
+            return dt
+
+        def get_player(run: Run, guid: str, name: str) -> PlayerRun:
+            p = run.players.get(guid)
+            if p is None:
+                p = PlayerRun(guid=guid, name=name)
+                run.players[guid] = p
+            elif name and not p.name:
+                p.name = name
+            if name and guid not in names:
+                names[guid] = name
+            return p
+
+        def close_current() -> None:
+            nonlocal cur
+            if cur is not None:
+                if cur.end is None:
+                    cur.end = cur.start
+                runs.append(cur)
+                cur = None
 
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for lineno, raw in enumerate(fh, 1):
@@ -213,219 +305,311 @@ class CombatLogParser:
                 tm = TIME_RE.match(line)
                 if not tm:
                     continue
-                ts = parse_time(tm)
+                ts = timestamp(tm)
                 rest = line[tm.end():].lstrip()
                 if not rest:
                     continue
-                fields = split_csv(rest)
+
+                fields = split_fields(rest)
                 event = fields[0]
-                args = fields[1:]
-
-                # --- определение формата лога ---
-                if self.advanced is None and event in GUID_EVENTS and args:
-                    if ADVANCED_PREFIX.match(args[0]):
-                        self.advanced = True
-                    elif HEX_GUID.match(args[0]):
-                        self.advanced = False
-                if self.advanced is None:
+                a = fields[1:]
+                if not a:
                     continue
 
-                res.lines_parsed += 1
+                # ---------- формат лога ----------
+                if event == "COMBAT_LOG_VERSION":
+                    for i, value in enumerate(a):
+                        if value == "ADVANCED_LOG_ENABLED" and i + 1 < len(a):
+                            res.advanced = a[i + 1].strip() == "1"
+                    continue
 
-                # --- смена локации ---
-                if event == "ZONE_CHANGE" and len(args) >= 2:
-                    zone = args[1].strip('"')
-                    if zone != current_zone:
+                # ---------- зоны и ключи ----------
+                if event == "ZONE_CHANGE":
+                    zone = a[1].strip('"') if len(a) > 1 else ""
+                    instance = to_int(a[0]) if a else 0
+                    if cur is not None and cur.zone == zone and cur.instance_id == instance:
+                        continue
+                    close_current()
+                    cur_zone = zone
+                    cur = Run(zone=zone, instance_id=instance, start=ts)
+                    continue
+
+                if event == "CHALLENGE_MODE_START":
+                    zone = a[0].strip('"') if a else cur_zone
+                    instance = to_int(a[1]) if len(a) > 1 else 0
+                    level = to_int(a[3]) if len(a) > 3 else 0
+                    if cur is None or cur.zone != zone:
                         close_current()
-                        current_zone = zone
-                        current = _RawRun(zone=zone, start=ts)
+                        cur = Run(zone=zone, instance_id=instance, start=ts)
+                    cur.key_level = level or None
+                    cur.instance_id = instance or cur.instance_id
+                    cur.timer_limit = dungeon_timer(cur.zone)
                     continue
 
-                if current is None:
-                    current = _RawRun(zone=current_zone or "Без зоны", start=ts)
-
-                # --- связка питомцев ---
-                if event == "SPELL_SUMMON" and self.advanced and len(args) > 4:
-                    owner = args[0]
-                    pet = args[4]
-                    if owner.startswith("Player-") and pet:
-                        res.pets_of[pet] = owner
+                if event == "CHALLENGE_MODE_END":
+                    if cur is None:
+                        cur = Run(zone=cur_zone or "Неизвестно", start=ts)
+                    cur.key_success = (to_int(a[1]) == 1) if len(a) > 1 else None
+                    if len(a) > 2 and to_int(a[2]):
+                        cur.key_level = to_int(a[2])
+                    if len(a) > 3:
+                        cur.key_time_ms = to_int(a[3])
+                    if len(a) > 4 and to_int(a[4]) > 60_000:
+                        cur.timer_limit = to_int(a[4]) // 1000
+                    cur.timer_limit = cur.timer_limit or dungeon_timer(cur.zone)
+                    close_current()
                     continue
 
-                if event not in DAMAGE_EVENTS:
+                if event == "ENCOUNTER_START":
+                    if cur is not None and len(a) > 3:
+                        cur.group_size = max(cur.group_size, to_int(a[3]))
                     continue
 
-                src_guid, src_name, amount, crit, school = self._extract_damage(args, event)
-                if not src_guid or not src_name:
-                    continue
-                if src_guid.startswith("Player-"):
-                    res.players.setdefault(src_guid, src_name)
-                if amount <= 0:
+                if event == "ENCOUNTER_END":
+                    if cur is not None and len(a) > 4 and to_int(a[4]) == 1:
+                        cur.boss_kills += 1
                     continue
 
-                src = current.sources.get(src_guid)
-                if src is None:
-                    src = _RawSource(src_name)
-                    current.sources[src_guid] = src
-                current.group_damage += amount
-                src.damage += amount
-                src.hits += 1
-                src.active.add(int(ts.timestamp()))
-                if current.end is None or ts > current.end:
-                    current.end = ts
+                # ---------- характеристики ----------
+                if event == "COMBATANT_INFO":
+                    info = self._parse_combatant_info(a)
+                    if info is not None:
+                        res.combatants[info.guid] = info
+                        res.has_combatant_info = True
+                        if cur is not None:
+                            get_player(cur, info.guid, "").info = info
+                    continue
 
-                ability_name = self._ability_name(args, event)
-                st = src.abilities.get(ability_name)
-                if st is None:
-                    st = AbilityStat(ability_name)
-                    src.abilities[ability_name] = st
-                st.damage += amount
-                st.hits += 1
-                if crit:
-                    st.crits += 1
-                if amount > st.max_hit:
-                    st.max_hit = amount
+                # ---------- питомцы ----------
+                if event == "SPELL_SUMMON":
+                    if len(a) > 4:
+                        owner, pet = a[0], a[4]
+                        if owner.startswith("Player-") and pet:
+                            pets_of[pet] = owner
+                    continue
+
+                # ---------- смерть ----------
+                if event in ("UNIT_DIED", "UNIT_DESTROYED"):
+                    if len(a) > 4 and a[4].startswith("Player-") and cur is not None:
+                        p = get_player(cur, a[4], clean_name(a[5] if len(a) > 5 else ""))
+                        p.deaths += 1
+                    continue
+
+                # ---------- прерывания ----------
+                if event == "SPELL_INTERRUPT":
+                    if a and a[0].startswith("Player-") and cur is not None:
+                        p = get_player(cur, a[0], clean_name(a[1] if len(a) > 1 else ""))
+                        p.interrupts += 1
+                        p.active.add(int(ts.timestamp()))
+                    continue
+
+                # ---------- урон / исцеление ----------
+                if event in DAMAGE_EVENTS or event in HEAL_EVENTS:
+                    if cur is None:
+                        continue
+                    src_guid = a[0] if a else ""
+                    if not src_guid or src_guid in NIL_GUIDS:
+                        continue
+                    src_name = clean_name(a[1] if len(a) > 1 else "")
+                    adv, amount_idx = self._layout(a, event)
+
+                    owner = pets_of.get(src_guid, "")
+                    if adv:
+                        owner_idx = 9 if event.startswith("SWING") else 12
+                        owner_guid = a[owner_idx] if len(a) > owner_idx else ""
+                        if owner_guid.startswith("Player-"):
+                            owner = owner_guid
+                    if owner:
+                        src_guid = owner
+                        src_name = ""
+
+                    if not src_guid.startswith("Player-"):
+                        continue
+
+                    p = get_player(cur, src_guid, src_name)
+                    amount = to_int(a[amount_idx]) if len(a) > amount_idx else 0
+                    if amount <= 0:
+                        continue
+
+                    if event in DAMAGE_EVENTS:
+                        p.damage += amount
+                        ability = self._ability_name(a, event)
+                        st = p.abilities.get(ability)
+                        if st is None:
+                            st = AbilityStat(ability)
+                            p.abilities[ability] = st
+                        st.damage += amount
+                        st.hits += 1
+                        if self._is_crit(a, event, adv):
+                            st.crits += 1
+                        if amount > st.max_hit:
+                            st.max_hit = amount
+                    else:
+                        p.healing += amount
+                    p.active.add(int(ts.timestamp()))
+                    continue
+
+                # ---------- касты (для определения класса без COMBATANT_INFO) ----------
+                if event == "SPELL_CAST_SUCCESS":
+                    if cur is not None and a and a[0].startswith("Player-"):
+                        sid = to_int(a[8]) if len(a) > 8 else 0
+                        if sid:
+                            p = get_player(cur, a[0], clean_name(a[1] if len(a) > 1 else ""))
+                            p.spell_ids[sid] = p.spell_ids.get(sid, 0) + 1
 
         close_current()
 
-        # --- выбор персонажа ---
-        player_guid = self._pick_player(raw_runs, res)
-        res.player_guid = player_guid
-        res.player_name = res.players.get(player_guid, "")
-        res.advanced = bool(self.advanced)
+        # ---------- финализация ----------
+        res.players.update(names)
+        for guid in res.combatants:
+            res.players.setdefault(guid, "")
 
-        # --- сборка итоговых заходов ---
-        targets = set()
-        if player_guid:
-            targets.add(player_guid)
-            if self.include_pets:
-                for pet, owner in res.pets_of.items():
-                    if owner == player_guid:
-                        targets.add(pet)
+        for run in runs:
+            for guid, info in res.combatants.items():
+                if guid in run.players and run.players[guid].info is None:
+                    run.players[guid].info = info
+            for p in run.players.values():
+                if p.info is not None:
+                    p.cls = p.info.cls or p.cls
+                    p.spec = p.info.spec or p.spec
+                if not p.cls:
+                    p.cls = guess_class(p.spell_ids)
+                if not p.name:
+                    p.name = res.players.get(p.guid, "")
 
-        for rr in raw_runs:
-            run = Run(zone=rr.zone, start=rr.start, end=rr.end,
-                      total_group_damage=rr.group_damage)
-            for guid, src in rr.sources.items():
-                if guid not in targets:
-                    continue
-                run.damage += src.damage
-                run.hits += src.hits
-                run.active_seconds |= src.active
-                for name, st in src.abilities.items():
-                    tgt = run.abilities.get(name)
-                    if tgt is None:
-                        run.abilities[name] = AbilityStat(name, st.damage, st.hits,
-                                                          st.crits, st.max_hit)
-                    else:
-                        tgt.damage += st.damage
-                        tgt.hits += st.hits
-                        tgt.crits += st.crits
-                        tgt.max_hit = max(tgt.max_hit, st.max_hit)
-            res.runs.append(run)
+        res.runs = [r for r in runs if r.players]
+
+        totals: dict[str, int] = defaultdict(int)
+        for run in res.runs:
+            for guid, p in run.players.items():
+                totals[guid] += p.damage
+        if totals:
+            best = max(totals, key=lambda g: totals[g])
+            res.player_guid = best
+            res.player_name = res.players.get(best, "")
 
         return res
 
     # ------------------------------------------------------------------
-    def _pick_player(self, raw_runs: list, res: ParseResult) -> str:
-        # 1) по фильтру имени
-        if self.player_filter:
-            for guid, name in res.players.items():
-                if clean_name(name).lower() == self.player_filter:
-                    return guid
-        # 2) по владельцу питомцев
-        if res.pets_of:
-            owners = {o for o in res.pets_of.values() if o.startswith("Player-")}
-            if len(owners) == 1:
-                return next(iter(owners))
-        # 3) игрок с наибольшим уроном
-        totals: dict = defaultdict(int)
-        names: dict = {}
-        for rr in raw_runs:
-            for guid, src in rr.sources.items():
-                if guid.startswith("Player-"):
-                    totals[guid] += src.damage
-                    names[guid] = src.name
-        if totals:
-            best = max(totals, key=lambda g: totals[g])
-            res.players.setdefault(best, names.get(best, ""))
-            return best
-        return ""
+    @staticmethod
+    def _layout(a: list[str], event: str) -> tuple[bool, int]:
+        """Определяет раскладку строки и индекс поля с количеством.
 
-    # ------------------------------------------------------------------
-    def _extract_damage(self, args: list, event: str):
-        """Возвращает (sourceGUID, sourceName, amount, crit, school)."""
-        if self.advanced:
-            src_guid = args[0] if args else ""
-            src_name = args[1] if len(args) > 1 else ""
-            if event == "SWING_DAMAGE":
-                amount = to_int(args[8]) if len(args) > 8 else 0
-                crit = (len(args) > 14 and args[14] == "1")
-                school = to_int(args[10]) if len(args) > 10 else 0
-            else:
-                amount = to_int(args[11]) if len(args) > 11 else 0
-                crit = (len(args) > 17 and args[17] == "1")
-                school = to_int(args[13]) if len(args) > 13 else 0
-            return src_guid, clean_name(src_name), amount, crit, school
+        Расширенная раскладка добавляет 17 полей, поэтому строка заметно длиннее.
+        Ориентируемся и на длину, и на GUID в позиции infoGUID: в некоторых
+        клиентах он записан нулями, но нулевой GUID — это всё равно 16 символов.
+        """
+        if event.startswith("SWING"):
+            adv = len(a) >= 25 and looks_like_guid(a[8] or "")
+            return adv, (25 if adv else 8)
+        adv = len(a) >= 25 and looks_like_guid(a[11] or "")
+        return adv, (28 if adv else 11)
 
-        src_name = args[0] if args else ""
-        src_guid = args[1] if len(args) > 1 else ""
-        if event == "SWING_DAMAGE":
-            amount = to_int(args[6]) if len(args) > 6 else 0
-            crit = (len(args) > 12 and args[12] == "1")
+    @staticmethod
+    def _is_crit(a: list[str], event: str, adv: bool) -> bool:
+        if adv:
+            idx = 31 if event.startswith("SWING") else 34
         else:
-            amount = to_int(args[9]) if len(args) > 9 else 0
-            crit = (len(args) > 15 and args[15] == "1")
-        return src_guid, clean_name(src_name), amount, crit, 0
+            idx = 12 if event.startswith("SWING") else 17
+        return len(a) > idx and a[idx] == "1"
+
+    @staticmethod
+    def _ability_name(a: list[str], event: str) -> str:
+        if event.startswith("SWING") or event in ("DAMAGE_SHIELD", "DAMAGE_SPLIT"):
+            return "Белая атака"
+        name = a[9] if len(a) > 9 else ""
+        if not name or name in NIL_GUIDS:
+            return "Белая атака"
+        return name.strip('"')
 
     # ------------------------------------------------------------------
-    def _ability_name(self, args: list, event: str) -> str:
-        if event in MELEE_EVENTS:
-            return "Белая атака"
-        idx = 9 if self.advanced else 7
-        name = args[idx] if len(args) > idx else ""
-        return name or "Белая атака"
+    @staticmethod
+    def _parse_combatant_info(a: list[str]) -> CombatantInfo | None:
+        if len(a) < 25:
+            return None
+        guid = a[0]
+        if not guid.startswith("Player-"):
+            return None
+
+        info = CombatantInfo(guid=guid)
+        info.strength = to_int(a[2])
+        info.agility = to_int(a[3])
+        info.stamina = to_int(a[4])
+        info.intellect = to_int(a[5])
+        info.crit = to_int(a[9])
+        info.haste = to_int(a[14])
+        info.mastery = to_int(a[18])
+        info.versatility = to_int(a[19])
+        info.armor = to_int(a[22])
+
+        spec_id = 0
+        for i in range(20, min(len(a), 32)):
+            if to_int(a[i]) in SPEC_IDS:
+                spec_id = to_int(a[i])
+                break
+        info.spec_id = spec_id
+        info.cls, info.spec = class_by_spec(spec_id)
+
+        best_field = ""
+        for value in a[24:]:
+            if value.startswith("[") and len(value) > len(best_field):
+                best_field = value
+        if best_field:
+            levels = [int(m.group(2)) for m in GEAR_ITEM_RE.finditer(best_field)
+                      if int(m.group(1)) > 0 and int(m.group(2)) > 0]
+            if levels:
+                info.ilvl = round(sum(levels) / len(levels), 1)
+
+        return info
 
 
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
-def cli_report(path: str, player: str | None = None, include_pets: bool = True) -> None:
-    parser = CombatLogParser(player_filter=player, include_pets=include_pets)
-    res = parser.parse(path)
+def _n(v) -> str:
+    return f"{int(round(v)):,}".replace(",", " ")
+
+
+def cli_report(path: str, only_keys: bool = False) -> None:
+    res = CombatLogParser().parse(path)
+
     print(f"Файл: {path}")
-    print(f"Формат: {'расширенный (advanced)' if res.advanced else 'обычный'}")
-    print(f"Строк: {res.lines_total}, разобрано: {res.lines_parsed}")
-    print(f"Игроков: {len(res.players)}, заходов: {len(res.runs)}")
-    if res.player_name:
-        print(f"Персонаж: {res.player_name} ({res.player_guid})")
+    print(f"Формат: {'расширенный' if res.advanced else 'обычный'}, "
+          f"COMBATANT_INFO: {'есть' if res.has_combatant_info else 'НЕТ'}")
+    print(f"Строк: {res.lines_total}, заходов: {len(res.runs)}, игроков: {len(res.players)}")
     print()
 
-    def n(v):
-        return f"{v:,}".replace(",", " ")
+    runs = [r for r in res.runs if r.is_dungeon]
+    if only_keys:
+        runs = [r for r in runs if r.key_level]
+    runs.sort(key=lambda r: r.start or datetime.min, reverse=True)
 
-    for run in res.runs:
-        if run.damage <= 0:
-            continue
-        print(f"[{run.zone}]  {run.start}  длит. {run.duration}  "
-              f"урон {n(run.damage)}  DPS {n(round(run.dps))}  "
-              f"доля {run.share:.1f}%  актив. {run.active_time:.0f} c")
-        for a in sorted(run.abilities.values(), key=lambda x: x.damage, reverse=True)[:5]:
-            pct = 100.0 * a.damage / run.damage if run.damage else 0
-            print(f"     {a.name:<34} {n(a.damage):>12}  {pct:5.1f}%  ударов {a.hits}")
+    for run in runs:
+        head = f"[{run.zone}] {run.start:%d.%m %H:%M}"
+        if run.key_level:
+            head += f"  ключ +{run.key_level}"
+        if run.key_time_ms:
+            head += f"  время {run.duration}  {run.bonus}"
+        head += f"  урон {_n(run.total_damage)}  исц. {_n(run.total_healing)}"
+        print(head)
+        print(f"  {'Игрок':<18}{'Класс':<20}{'Урон':>12}{'ДПС':>8}"
+              f"{'Исц.':>12}{'Прер.':>7}{'См.':>5}")
+        for p in sorted(run.players.values(), key=lambda x: x.damage, reverse=True):
+            cls = f"{p.cls} / {p.spec}" if p.spec else (p.cls or "—")
+            print(f"  {p.name[:17]:<18}{cls[:19]:<20}{_n(p.damage):>12}"
+                  f"{_n(p.dps):>8}{_n(p.healing):>12}{p.interrupts:>7}{p.deaths:>5}")
         print()
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="WoW Damage Parser")
     ap.add_argument("log", nargs="?", help="путь к WoWCombatLog.txt")
-    ap.add_argument("--player", help="имя персонажа")
-    ap.add_argument("--no-pets", action="store_true", help="не учитывать питомцев")
     ap.add_argument("--cli", action="store_true", help="консольный отчёт")
+    ap.add_argument("--keys", action="store_true", help="только ключи")
     args = ap.parse_args()
 
     if args.cli and args.log:
-        cli_report(args.log, args.player, include_pets=not args.no_pets)
+        cli_report(args.log, only_keys=args.keys)
         return
 
     from gui import run_gui
