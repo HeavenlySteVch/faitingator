@@ -56,6 +56,7 @@ class DamageApp(ctk.CTk):
         self.current_run: Run | None = None
         self.log_path = ctk.StringVar(value=self._guess_log_path(default_log))
         self.search = ctk.StringVar()
+        self.only_instances = ctk.BooleanVar(value=True)
         self.only_keys = ctk.BooleanVar(value=False)
 
         self._build_ui()
@@ -92,8 +93,10 @@ class DamageApp(ctk.CTk):
         # ---- фильтры ----
         filt = ctk.CTkFrame(self)
         filt.pack(fill="x", **pad)
-        ctk.CTkCheckBox(filt, text="Только ключи", variable=self.only_keys,
+        ctk.CTkCheckBox(filt, text="Только подземелья", variable=self.only_instances,
                         command=self._refresh_runs).pack(side="left", padx=(10, 12))
+        ctk.CTkCheckBox(filt, text="Только ключи", variable=self.only_keys,
+                        command=self._refresh_runs).pack(side="left", padx=(0, 12))
         ctk.CTkLabel(filt, text="Поиск:").pack(side="left", padx=(4, 4))
         entry = ctk.CTkEntry(filt, textvariable=self.search, width=240,
                              placeholder_text="название подземелья")
@@ -323,7 +326,9 @@ class DamageApp(ctk.CTk):
             return
 
         text = self.search.get().strip().lower()
-        runs = [r for r in self.result.runs if r.is_dungeon]
+        runs = list(self.result.runs)
+        if self.only_instances.get():
+            runs = [r for r in runs if r.is_instance]
         if self.only_keys.get():
             runs = [r for r in runs if r.key_level]
         if text:

@@ -2,7 +2,7 @@
 r"""
 WoW Damage Parser — статистика заходов из combat log.
 
-Читает Logs\WoWCombatLog.txt (World of Warcraft), находит заходы в подземелья,
+Читает Logs\WoWCombatLog.txt (World of Warcraft), находит заходы в подземелья и рейды,
 считает урон, исцеление, прерывания и смерти по каждому игроку группы,
 определяет уровень ключа, время прохождения и бонус (+1/+2/+3).
 
@@ -11,12 +11,14 @@ WoW Damage Parser — статистика заходов из combat log.
 и характеристики каждого персонажа.
 
 Запуск GUI:        python wow_damage_app.py
-Запуск из консоли: python wow_damage_app.py --cli "путь\к\WoWCombatLog.txt" [--player Имя]
+Запуск из консоли: python wow_damage_app.py --cli "путь\к\WoWCombatLog.txt" [--keys] [--all]
+                   (по умолчанию только подземелья; --all — вместе с открытым миром)
 """
 from __future__ import annotations
 
 import argparse
 import re
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -112,6 +114,7 @@ class PlayerRun:
 class Run:
     zone: str
     instance_id: int = 0
+    difficulty: int = 0
     start: datetime | None = None
     end: datetime | None = None
     key_level: int | None = None
@@ -157,8 +160,18 @@ class Run:
         return "провал"
 
     @property
+    def is_instance(self) -> bool:
+        """Подземелье/рейд, а не открытый мир.
+
+        Ориентиры: сложность из ZONE_CHANGE (в открытом мире 0, в инстансе > 0),
+        пройденный ключ или убитые боссы.
+        """
+        return bool(self.key_level) or self.difficulty > 0 or self.boss_kills > 0
+
+    # совместимость со старым названием
+    @property
     def is_dungeon(self) -> bool:
-        return bool(self.key_level) or bool(self.players and self.total_damage > 0)
+        return self.is_instance
 
 
 @dataclass
@@ -212,11 +225,6 @@ def is_guid(value: str) -> bool:
     return bool(value) and bool(GUID_RE.match(value)) and value not in NIL_GUIDS
 
 
-def looks_like_guid(value: str) -> bool:
-    """GUID в любом виде, включая нулевой 0000000000000000."""
-    return bool(value) and bool(GUID_RE.match(value))
-
-
 def clean_name(name: str) -> str:
     if not name:
         return name
@@ -236,6 +244,33 @@ def to_int(value: str, default: int = 0) -> int:
             return int(float(value))
         except (TypeError, ValueError):
             return default
+
+
+def gear_ilvls(field_value: str) -> list[int]:
+    """Уровни предметов из поля экипировки COMBATANT_INFO.
+
+    Поле выглядит как [(itemID,ilvl,enchant,(азеритовые силы),(бонусы)), ...];
+    важно брать только верхний уровень, иначе в средний уровень попадут
+    идентификаторы азеритовых сил и чар (из-за чего он получается в разы выше).
+    """
+    inner = field_value.strip()
+    if inner.startswith("["):
+        inner = inner[1:]
+    if inner.endswith("]"):
+        inner = inner[:-1]
+
+    levels: list[int] = []
+    for item in split_fields(inner):
+        item = item.strip()
+        if not (item.startswith("(") and item.endswith(")")):
+            continue
+        parts = split_fields(item[1:-1])
+        if len(parts) < 2:
+            continue
+        item_id, ilvl = to_int(parts[0]), to_int(parts[1])
+        if item_id > 0 and 0 < ilvl < 1000:
+            levels.append(ilvl)
+    return levels
 
 
 # ----------------------------------------------------------------------------
@@ -327,11 +362,13 @@ class CombatLogParser:
                 if event == "ZONE_CHANGE":
                     zone = a[1].strip('"') if len(a) > 1 else ""
                     instance = to_int(a[0]) if a else 0
-                    if cur is not None and cur.zone == zone and cur.instance_id == instance:
+                    difficulty = to_int(a[2]) if len(a) > 2 else 0
+                    if (cur is not None and cur.zone == zone
+                            and cur.instance_id == instance and cur.difficulty == difficulty):
                         continue
                     close_current()
                     cur_zone = zone
-                    cur = Run(zone=zone, instance_id=instance, start=ts)
+                    cur = Run(zone=zone, instance_id=instance, difficulty=difficulty, start=ts)
                     continue
 
                 if event == "CHALLENGE_MODE_START":
@@ -414,11 +451,6 @@ class CombatLogParser:
                     adv, amount_idx = self._layout(a, event)
 
                     owner = pets_of.get(src_guid, "")
-                    if adv:
-                        owner_idx = 9 if event.startswith("SWING") else 12
-                        owner_guid = a[owner_idx] if len(a) > owner_idx else ""
-                        if owner_guid.startswith("Player-"):
-                            owner = owner_guid
                     if owner:
                         src_guid = owner
                         src_name = ""
@@ -440,7 +472,7 @@ class CombatLogParser:
                             p.abilities[ability] = st
                         st.damage += amount
                         st.hits += 1
-                        if self._is_crit(a, event, adv):
+                        if self._is_crit(a, event, adv, amount_idx):
                             st.crits += 1
                         if amount > st.max_hit:
                             st.max_hit = amount
@@ -495,23 +527,30 @@ class CombatLogParser:
     def _layout(a: list[str], event: str) -> tuple[bool, int]:
         """Определяет раскладку строки и индекс поля с количеством.
 
-        Расширенная раскладка добавляет 17 полей, поэтому строка заметно длиннее.
-        Ориентируемся и на длину, и на GUID в позиции infoGUID: в некоторых
-        клиентах он записан нулями, но нулевой GUID — это всё равно 16 символов.
+        Расширенная раскладка добавляет 17 полей, поэтому строка заметно
+        длиннее: у обычной (без расширенной) строки урона меньше 20 полей,
+        у расширенной — 30 и больше. Ориентируемся только на длину, потому что
+        infoGUID в расширенной части может быть не только Player-, но и
+        Creature-/Pet-/Vehicle-GUID (например, когда целью является питомец).
         """
         if event.startswith("SWING"):
-            adv = len(a) >= 25 and looks_like_guid(a[8] or "")
+            adv = len(a) >= 25
             return adv, (25 if adv else 8)
-        adv = len(a) >= 25 and looks_like_guid(a[11] or "")
+        adv = len(a) >= 30
         return adv, (28 if adv else 11)
 
     @staticmethod
-    def _is_crit(a: list[str], event: str, adv: bool) -> bool:
-        if adv:
-            idx = 31 if event.startswith("SWING") else 34
-        else:
+    def _is_crit(a: list[str], event: str, adv: bool, amount_idx: int = -1) -> bool:
+        if not adv:
             idx = 12 if event.startswith("SWING") else 17
-        return len(a) > idx and a[idx] == "1"
+            return len(a) > idx and a[idx] == "1"
+        # На клиентах Firestorm признак крита идёт на 7 полей позже урона
+        # (между ними: базовый урон до крита, «-1», школа и т.д.).
+        idx = amount_idx + 7 if amount_idx >= 0 else (
+            32 if event.startswith("SWING") else 35)
+        if len(a) > idx and a[idx] == "1":
+            return True
+        return False
 
     @staticmethod
     def _ability_name(a: list[str], event: str) -> str:
@@ -543,20 +582,31 @@ class CombatLogParser:
         info.armor = to_int(a[22])
 
         spec_id = 0
-        for i in range(20, min(len(a), 32)):
-            if to_int(a[i]) in SPEC_IDS:
-                spec_id = to_int(a[i])
-                break
+        # Основной вариант: armor, specID идут непосредственно перед списком
+        # талантов «(...)». Позиция фиксированная, поэтому значения
+        # характеристик (например, рейтинг универсальности = 577) не путаются
+        # со specID (577 — это «Охотник на демонов / Истребление»).
+        if len(a) > 23 and to_int(a[23]) in SPEC_IDS:
+            spec_id = to_int(a[23])
+        else:
+            # Запасной вариант: ищем specID перед полем талантов.
+            for i in range(19, min(len(a) - 1, 32)):
+                if to_int(a[i]) in SPEC_IDS and a[i + 1].startswith("("):
+                    spec_id = to_int(a[i])
+                    break
         info.spec_id = spec_id
         info.cls, info.spec = class_by_spec(spec_id)
 
         best_field = ""
+        best_count = 0
         for value in a[24:]:
-            if value.startswith("[") and len(value) > len(best_field):
-                best_field = value
+            if not value.startswith("["):
+                continue
+            count = len(GEAR_ITEM_RE.findall(value))
+            if count > best_count:  # экипировка — это список предметов (id, ilvl, ...)
+                best_field, best_count = value, count
         if best_field:
-            levels = [int(m.group(2)) for m in GEAR_ITEM_RE.finditer(best_field)
-                      if int(m.group(1)) > 0 and int(m.group(2)) > 0]
+            levels = gear_ilvls(best_field)
             if levels:
                 info.ilvl = round(sum(levels) / len(levels), 1)
 
@@ -570,7 +620,12 @@ def _n(v) -> str:
     return f"{int(round(v)):,}".replace(",", " ")
 
 
-def cli_report(path: str, only_keys: bool = False) -> None:
+def cli_report(path: str, only_keys: bool = False, everything: bool = False) -> None:
+    try:  # консоль Windows может не знать часть символов
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     res = CombatLogParser().parse(path)
 
     print(f"Файл: {path}")
@@ -579,7 +634,7 @@ def cli_report(path: str, only_keys: bool = False) -> None:
     print(f"Строк: {res.lines_total}, заходов: {len(res.runs)}, игроков: {len(res.players)}")
     print()
 
-    runs = [r for r in res.runs if r.is_dungeon]
+    runs = list(res.runs) if everything else [r for r in res.runs if r.is_instance]
     if only_keys:
         runs = [r for r in runs if r.key_level]
     runs.sort(key=lambda r: r.start or datetime.min, reverse=True)
@@ -606,10 +661,12 @@ def main() -> None:
     ap.add_argument("log", nargs="?", help="путь к WoWCombatLog.txt")
     ap.add_argument("--cli", action="store_true", help="консольный отчёт")
     ap.add_argument("--keys", action="store_true", help="только ключи")
+    ap.add_argument("--all", action="store_true",
+                    help="показывать всё, включая открытый мир (по умолчанию только подземелья)")
     args = ap.parse_args()
 
     if args.cli and args.log:
-        cli_report(args.log, only_keys=args.keys)
+        cli_report(args.log, only_keys=args.keys, everything=args.all)
         return
 
     from gui import run_gui
