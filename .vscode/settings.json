@@ -1,0 +1,16 @@
+{
+    "python.analysis.typeCheckingMode": "basic",
+    "python.terminal.activateEnvironment": true,
+    "files.encoding": "utf8",
+    "files.eol": "\r\n",
+    "editor.formatOnSave": false,
+    "editor.rulers": [100],
+    "[python]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true
+    },
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/*.pyc": true
+    }
+}

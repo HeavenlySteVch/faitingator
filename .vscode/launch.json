@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "WoW Damage Parser (GUI)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/wow_damage_app.py",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Тестовый лог (CLI)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/wow_damage_app.py",
+            "args": ["--cli", "tools/sample_logs/WoWCombatLog_sample.txt"],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}
