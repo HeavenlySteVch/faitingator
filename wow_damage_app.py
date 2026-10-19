@@ -52,6 +52,9 @@ NIL_GUIDS = {"", "0000000000000000", "0", "nil"}
 SPEC_IDS = set(SPECS.keys())
 # COMBATLOG_OBJECT_TYPE_PLAYER: цель урона — персонаж (самоурон «Пошатывания» и т.п.)
 FLAG_PLAYER = 0x400
+# COMBATLOG_OBJECT_TYPE_PET / _GUARDIAN: источник урона — питомец или страж
+# (у охотников второе животное и «Ужас» приходят как Creature- с флагом 0x2000)
+FLAG_PET = 0x1000 | 0x2000
 # Ауры, по которым восстанавливается связь «питомец -> владелец».
 AURA_EVENTS = ("SPELL_AURA_APPLIED", "SPELL_AURA_REFRESH", "SPELL_AURA_APPLIED_DOSE")
 
@@ -119,12 +122,14 @@ class PlayerRun:
 class Run:
     zone: str
     instance_id: int = 0
+    cm_id: int = 0
     difficulty: int = 0
     start: datetime | None = None
     end: datetime | None = None
     key_level: int | None = None
     key_success: bool | None = None
     key_time_ms: int | None = None
+    key_start: datetime | None = None
     timer_limit: int | None = None
     group_size: int = 0
     boss_kills: int = 0
@@ -398,6 +403,19 @@ class CombatLogParser:
                 if not a:
                     continue
 
+                # ---------- владелец питомца из расширенного блока ----------
+                # В расширенном логе после способности идут два GUID: сама цель
+                # и её владелец. У питомца/стража владелец — игрок, поэтому связь
+                # «питомец -> хозяин» берётся прямо из любой строки, где питомец
+                # является целью (урон по нему, лечение, энергия).
+                if len(a) > 12:
+                    dst = a[4]
+                    if (dst and dst not in NIL_GUIDS
+                            and not dst.startswith("Player-")
+                            and a[11] == dst
+                            and a[12].startswith("Player-")):
+                        pets_of.setdefault(dst, a[12])
+
                 # ---------- формат лога ----------
                 if event == "COMBAT_LOG_VERSION":
                     for i, value in enumerate(a):
@@ -421,13 +439,28 @@ class CombatLogParser:
                 if event == "CHALLENGE_MODE_START":
                     zone = a[0].strip('"') if a else cur_zone
                     instance = to_int(a[1]) if len(a) > 1 else 0
+                    cm_id = to_int(a[2]) if len(a) > 2 else 0
                     level = to_int(a[3]) if len(a) > 3 else 0
                     if cur is None or cur.zone != zone:
                         close_current()
                         cur = Run(zone=zone, instance_id=instance, start=ts)
                     cur.key_level = level or None
                     cur.instance_id = instance or cur.instance_id
-                    cur.timer_limit = dungeon_timer(cur.zone)
+                    cur.cm_id = cm_id or cur.cm_id
+                    cur.timer_limit = dungeon_timer(cur.zone, cur.cm_id)
+                    # Ключ начался: игра и Details считают урон/исцеление/смерти
+                    # именно с этого момента. Всё, что набралось с момента входа
+                    # в данж (мусор до вставки ключа), отбрасываем.
+                    if level:
+                        cur.key_start = ts
+                        for p in cur.players.values():
+                            p.damage = 0
+                            p.healing = 0
+                            p.interrupts = 0
+                            p.deaths = 0
+                            p.active.clear()
+                            p.abilities.clear()
+                            p.spell_ids.clear()
                     continue
 
                 if event == "CHALLENGE_MODE_END":
@@ -447,7 +480,7 @@ class CombatLogParser:
                     cur.key_time_ms = vals[2]
                     if len(a) > 4 and to_int(a[4]) > 60_000:
                         cur.timer_limit = to_int(a[4]) // 1000
-                    cur.timer_limit = cur.timer_limit or dungeon_timer(cur.zone)
+                    cur.timer_limit = cur.timer_limit or dungeon_timer(cur.zone, cur.cm_id)
                     close_current()
                     continue
 
@@ -513,16 +546,17 @@ class CombatLogParser:
 
                     owner = pets_of.get(src_guid, "")
                     if owner:
-                        src_guid = owner
-                        src_name = ""
-                    if not src_guid.startswith("Player-"):
-                        if src_guid.startswith("Pet-"):
-                            # владелец питомца может выясниться позже (по аурам)
-                            pending_pets.setdefault(src_guid, []).append(
-                                (cur, src_name, amount, event, a, adv, amount_idx, ts))
+                        credit(cur, owner, "", amount, event, a, adv, amount_idx, ts)
                         continue
-
-                    credit(cur, src_guid, src_name, amount, event, a, adv, amount_idx, ts)
+                    if src_guid.startswith("Player-"):
+                        credit(cur, src_guid, src_name, amount, event, a, adv, amount_idx, ts)
+                        continue
+                    # питомец или страж: владелец может выясниться позже
+                    is_pet = src_guid.startswith("Pet-") or (
+                        len(a) > 2 and to_flags(a[2]) & FLAG_PET)
+                    if is_pet:
+                        pending_pets.setdefault(src_guid, []).append(
+                            (cur, src_name, amount, event, a, adv, amount_idx, ts))
                     continue
 
                 # ---------- ауры: связь «питомец -> владелец» ----------
@@ -553,7 +587,7 @@ class CombatLogParser:
             if (owner_guid, spell_id) in aura_on_players:
                 continue
             for target in targets:
-                if target.startswith("Pet-"):
+                if not target.startswith("Player-"):
                     pet_candidates.setdefault(target, set()).add(owner_guid)
         for pet_guid, events in pending_pets.items():
             owner = pets_of.get(pet_guid, "")
@@ -563,6 +597,9 @@ class CombatLogParser:
             if not owner:
                 continue
             for run_obj, name, amount, event, a, adv, amount_idx, ts in events:
+                # урон питомца до старта ключа в зачёт не идёт
+                if run_obj.key_start and ts < run_obj.key_start:
+                    continue
                 credit(run_obj, owner, "", amount, event, a, adv, amount_idx, ts)
 
         # ---------- финализация ----------
@@ -646,7 +683,11 @@ class CombatLogParser:
         name = a[9] if len(a) > 9 else ""
         if not name or name in NIL_GUIDS:
             return "Белая атака"
-        return name.strip('"')
+        # в журнале название завёрнуто в кавычки, внутренние кавычки экранированы:
+        # "Команда \"Взять!\"" -> Команда "Взять!"
+        if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
+            name = name[1:-1]
+        return name.replace('\\"', '"')
 
     # ------------------------------------------------------------------
     @staticmethod

@@ -222,28 +222,47 @@ def guess_class(spell_ids: dict[int, int]) -> str:
     return ""
 
 
-# Таймеры подземелий BfA (в секундах).
+# Таймеры подземелий BfA (в секундах) — из клиентской таблицы MapChallengeMode
+# (build 8.3.7.35662, поле CriteriaCount_0 = лимит времени ключа).
 # Ключ ищется как подстрока в названии зоны (без учёта регистра).
 DUNGEON_TIMERS: dict[str, int] = {
     "атал'дазар": 1800, "atal'dazar": 1800,
     "вольная гавань": 1980, "freehold": 1980,
-    "гробница королей": 1980, "kings' rest": 1980,
-    "святилище штормов": 2160, "shrine of the storm": 2160,
+    "гробница королей": 2520, "kings' rest": 2520,
+    "святилище штормов": 2520, "shrine of the storm": 2520,
     "осада боралуса": 2160, "siege of boralus": 2160,
-    "храм сетралисс": 1800, "temple of sethraliss": 1800,
-    "материнская жила": 1980, "motherlode": 1980,
-    "подгнилье": 1800, "underrot": 1800,
+    "храм сетралисс": 2160, "temple of sethraliss": 2160,
+    "материнская жила": 2340, "motherlode": 2340,
+    "подгнилье": 1980, "underrot": 1980,
     "тол дагор": 2160, "tol dagor": 2160,
     "усадьба уэйкрестов": 2340, "waycrest manor": 2340,
-    "мехагон: свалка": 1980, "mechagon: junkyard": 1980,
-    "мехагон: мастерская": 1980, "mechagon: workshop": 1980,
-    "свалка мехагона": 1980, "мастерская мехагона": 1980,
-    "операция: мехагон": 1980,
+    "мехагон: свалка": 2280, "mechagon: junkyard": 2280,
+    "мехагон: мастерская": 1920, "mechagon: workshop": 1920,
+    "свалка мехагона": 2280, "мастерская мехагона": 1920,
+}
+
+# То же по ChallengeModeID (третий столбец CHALLENGE_MODE_START) — точнее, чем
+# по названию, и не зависит от языка клиента.
+DUNGEON_TIMERS_BY_ID: dict[int, int] = {
+    244: 1800,  # Atal'Dazar
+    245: 1980,  # Freehold
+    246: 2160,  # Tol Dagor
+    247: 2340,  # The MOTHERLODE!!
+    248: 2340,  # Waycrest Manor
+    249: 2520,  # Kings' Rest
+    250: 2160,  # Temple of Sethraliss
+    251: 1980,  # The Underrot
+    252: 2520,  # Shrine of the Storm
+    353: 2160,  # Siege of Boralus
+    369: 2280,  # Operation: Mechagon — Junkyard
+    370: 1920,  # Operation: Mechagon — Workshop
 }
 
 
-def dungeon_timer(zone: str) -> int | None:
-    """Таймер подземелья по названию зоны (секунды) или None."""
+def dungeon_timer(zone: str, challenge_mode_id: int = 0) -> int | None:
+    """Таймер подземелья в секундах: сначала по ID ключа, затем по названию."""
+    if challenge_mode_id and challenge_mode_id in DUNGEON_TIMERS_BY_ID:
+        return DUNGEON_TIMERS_BY_ID[challenge_mode_id]
     if not zone:
         return None
     low = zone.lower().replace("ё", "е")
