@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import threading
 import traceback
+import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 import customtkinter as ctk
 
@@ -21,6 +22,186 @@ def fmt_int(v) -> str:
         return f"{int(round(float(v))):,}".replace(",", " ")
     except Exception:
         return str(v)
+
+
+def contrast_text(color: str) -> str:
+    """Тёмный или светлый текст — чтобы читался на фоне указанного цвета."""
+    try:
+        r = int(color[1:3], 16)
+        g = int(color[3:5], 16)
+        b = int(color[5:7], 16)
+    except Exception:
+        return "#ffffff"
+    lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+    return "#101010" if lum > 0.6 else "#ffffff"
+
+
+# ----------------------------------------------------------------------------
+# Таблица с полосами (canvas)
+# ----------------------------------------------------------------------------
+class BarTable:
+    """Таблица на Canvas: ячейки могут заполняться цветом пропорционально значению.
+
+    ttk.Treeview не умеет красить часть ячейки, поэтому таблица группы рисуется
+    на Canvas: у лучшего по урону игрока полоса заполнена целиком, у остальных —
+    на долю от его урона (как в дпс-метрах).
+    """
+
+    ROW_H = 24
+    HEAD_H = 28
+
+    def __init__(self, parent, columns):
+        self.columns = columns
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True)
+        frame.rowconfigure(1, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        # заголовок — отдельным холстом, чтобы не уезжал при прокрутке строк
+        self.head_canvas = tk.Canvas(frame, bg="#1f1f1f", highlightthickness=0,
+                                     bd=0, height=self.HEAD_H)
+        self.canvas = tk.Canvas(frame, bg="#2b2b2b", highlightthickness=0, bd=0)
+        self.vsb = ttk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
+        self.hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=self.vsb.set, xscrollcommand=self._on_xscroll)
+        self.head_canvas.grid(row=0, column=0, sticky="ew")
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+        self.vsb.grid(row=1, column=1, sticky="ns")
+        self.hsb.grid(row=2, column=0, sticky="ew")
+
+        self.rows: list[dict] = []
+
+        try:
+            self.font = tkfont.nametofont("TkDefaultFont").copy()
+        except Exception:
+            self.font = tkfont.Font(family="Segoe UI", size=9)
+        self.font_head = self.font.copy()
+        self.font_head.configure(weight="bold")
+
+        self.canvas.bind("<Configure>", lambda _e: self.redraw())
+        self.head_canvas.bind("<Configure>", lambda _e: self._draw_header())
+        for widget in (self.canvas, self.head_canvas):
+            widget.bind("<MouseWheel>", self._on_wheel)
+            widget.bind("<Shift-MouseWheel>", self._on_wheel_x)
+
+    # ------------------------------------------------------------------
+    def set_rows(self, rows: list[dict]) -> None:
+        self.rows = rows
+        self.canvas.yview_moveto(0.0)
+        self.redraw()
+
+    def clear(self) -> None:
+        self.set_rows([])
+
+    def row_values(self, index: int) -> list[str]:
+        """Тексты ячеек строки — для проверок и отладки."""
+        row = self.rows[index]
+        out = []
+        for col in self.columns:
+            cell = row.get(col["key"], "")
+            if isinstance(cell, dict):
+                out.append(str(cell.get("text", "")))
+            else:
+                out.append(str(cell))
+        return out
+
+    # ------------------------------------------------------------------
+    def _on_wheel(self, event):
+        self.canvas.yview_scroll(-int(event.delta / 120), "units")
+        return "break"
+
+    def _on_wheel_x(self, event):
+        self.canvas.xview_scroll(-int(event.delta / 120), "units")
+        return "break"
+
+    def _on_xscroll(self, first, last):
+        self.hsb.set(first, last)
+        self._draw_header()  # заголовок едет вместе со столбцами
+
+    def _layout(self) -> list[tuple[int, int]]:
+        """Координаты и ширины колонок с учётом растягиваемых."""
+        stretch = [c for c in self.columns if c.get("stretch")]
+        fixed = sum(int(c["width"]) for c in self.columns)
+        extra = 0
+        if stretch:
+            extra = max(0, self.canvas.winfo_width() - fixed) // len(stretch)
+        xs, x = [], 0
+        for col in self.columns:
+            width = int(col["width"]) + (extra if col.get("stretch") else 0)
+            xs.append((x, width))
+            x += width
+        return xs
+
+    def _text_x(self, x: int, width: int, anchor: str) -> tuple[float, str]:
+        if anchor == "e":
+            return x + width - 8, "e"
+        if anchor == "center":
+            return x + width / 2, "center"
+        return x + 8, "w"
+
+    # ------------------------------------------------------------------
+    def _draw_header(self) -> None:
+        self.head_canvas.delete("all")
+        xs = self._layout()
+        visible_w = max(sum(w for _x, w in xs), self.head_canvas.winfo_width())
+        offset = self.canvas.canvasx(0)
+        self.head_canvas.create_rectangle(0, 0, visible_w, self.HEAD_H,
+                                          fill="#1f1f1f", width=0)
+        for (x, w), col in zip(xs, self.columns):
+            tx, anchor = self._text_x(x, w, col.get("anchor", "w"))
+            self.head_canvas.create_text(tx - offset, self.HEAD_H / 2 + 1,
+                                         text=col["title"], anchor=anchor,
+                                         fill="#ffffff", font=self.font_head)
+        self.head_canvas.create_line(0, self.HEAD_H - 1, visible_w,
+                                     self.HEAD_H - 1, fill="#454545")
+
+    def redraw(self) -> None:
+        self.canvas.delete("all")
+        xs = self._layout()
+        total_w = sum(w for _x, w in xs)
+        visible_w = max(total_w, self.canvas.winfo_width())
+        height = max(len(self.rows) * self.ROW_H, self.canvas.winfo_height())
+        self.canvas.configure(scrollregion=(0, 0, total_w, height))
+        self._draw_header()
+
+        for i, row in enumerate(self.rows):
+            y = i * self.ROW_H
+            if i % 2:
+                self.canvas.create_rectangle(0, y, visible_w, y + self.ROW_H,
+                                             fill="#303030", width=0, tags="rowbg")
+            for (x, w), col in zip(xs, self.columns):
+                self._draw_cell(row.get(col["key"], ""), x, w, y,
+                                col.get("anchor", "w"))
+
+    def _draw_cell(self, cell, x: int, w: int, y: int, anchor: str) -> None:
+        if not isinstance(cell, dict):
+            cell = {"text": cell}
+        text = str(cell.get("text", ""))
+        value = cell.get("bar")
+        color = cell.get("color") or "#3a6ea5"
+
+        if value is None:
+            tx, ta = self._text_x(x, w, anchor)
+            self.canvas.create_text(tx, y + self.ROW_H / 2, text=text,
+                                    anchor=ta, fill=color, font=self.font)
+            return
+
+        # полоса: ширина = доля от максимума
+        top = float(cell.get("max") or 0)
+        frac = float(value) / top if top > 0 else 0.0
+        frac = max(0.0, min(1.0, frac))
+        x0, x1 = x + 4, x + w - 4
+        y0, y1 = y + 4, y + self.ROW_H - 4
+        self.canvas.create_rectangle(x0, y0, x1, y1, fill="#3a3a3a", width=0,
+                                     tags="track")
+        cursor = x0 + (x1 - x0) * frac
+        if frac > 0:
+            self.canvas.create_rectangle(x0, y0, cursor, y1, fill=color, width=0,
+                                         tags="bar")
+        if text:
+            self.canvas.create_text(x + w - 8, y + self.ROW_H / 2, text=text,
+                                    anchor="e", fill=contrast_text(color),
+                                    font=self.font)
 
 
 def fmt_duration(td) -> str:
@@ -143,13 +324,20 @@ class DamageApp(ctk.CTk):
         tab_ab = self.tabs.add("Способности")
         tab_info = self.tabs.add("Инфо")
 
-        # --- группа ---
-        gcols = ("name", "class", "spec", "damage", "dps", "share",
-                 "healing", "interrupts", "deaths")
-        gheads = ("Игрок", "Класс", "Специализация", "Урон", "ДПС", "Доля",
-                  "Исцеление", "Прерывания", "Смерти")
-        gwidths = (170, 150, 170, 120, 90, 80, 120, 100, 80)
-        self.tree_group = self._make_tree(tab_group, gcols, gheads, gwidths)
+        # --- группа (таблица с полосой урона) ---
+        gcols = [
+            {"key": "name", "title": "Игрок", "width": 160, "anchor": "w", "stretch": True},
+            {"key": "ilvl", "title": "iLvl", "width": 60, "anchor": "center"},
+            {"key": "class", "title": "Класс", "width": 130, "anchor": "w"},
+            {"key": "spec", "title": "Специализация", "width": 150, "anchor": "w"},
+            {"key": "damage", "title": "Урон", "width": 200, "anchor": "e"},
+            {"key": "dps", "title": "ДПС", "width": 90, "anchor": "center"},
+            {"key": "share", "title": "Доля", "width": 80, "anchor": "center"},
+            {"key": "healing", "title": "Исцеление", "width": 120, "anchor": "center"},
+            {"key": "interrupts", "title": "Прерывания", "width": 100, "anchor": "center"},
+            {"key": "deaths", "title": "Смерти", "width": 80, "anchor": "center"},
+        ]
+        self.group_table = BarTable(tab_group, gcols)
 
         # --- характеристики ---
         scols = ("name", "class", "ilvl", "str", "agi", "sta", "int",
@@ -242,8 +430,9 @@ class DamageApp(ctk.CTk):
             "================\n"
             "• Заходы: дата, подземелье, уровень ключа, результат (+1/+2/+3),\n"
             "  время прохождения и таймер подземелья.\n"
-            "• Группа: кто был в группе, класс и специализация, урон, ДПС,\n"
-            "  доля от общего урона, исцеление, прерывания, смерти.\n"
+            "• Группа: кто был в группе, уровень предметов, класс и специализация,\n"
+            "  урон (полоса заполняется по доле от лучшего игрока), ДПС, доля\n"
+            "  от общего урона, исцеление, прерывания, смерти.\n"
             "• Характеристики: уровень предметов, сила, ловкость, выносливость,\n"
             "  интеллект, броня, крит, скорость, искусность, универсальность.\n"
             "• Способности: разбивка урона выбранного игрока по способностям.\n\n"
@@ -361,9 +550,10 @@ class DamageApp(ctk.CTk):
 
     # ------------------------------------------------------------------
     def _clear_details(self) -> None:
-        for tree in (self.tree_group, self.tree_stats, self.tree_ab):
+        for tree in (self.tree_stats, self.tree_ab):
             for item in tree.get_children():
                 tree.delete(item)
+        self.group_table.clear()
         self.ability_player.configure(values=["—"])
         self.ability_player.set("—")
 
@@ -377,23 +567,27 @@ class DamageApp(ctk.CTk):
         self.current_run = run
 
         # --- группа ---
-        for item in self.tree_group.get_children():
-            self.tree_group.delete(item)
         total = run.total_damage or 1
         players = sorted(run.players.values(), key=lambda p: p.damage, reverse=True)
+        top_damage = max((p.damage for p in players), default=0)
+        rows = []
         for p in players:
             share = 100.0 * p.damage / total if run.total_damage else 0.0
-            self.tree_group.insert("", "end", values=(
-                p.name or p.guid,
-                p.cls or "—",
-                p.spec or "",
-                fmt_int(p.damage),
-                fmt_int(p.dps),
-                f"{share:.1f} %",
-                fmt_int(p.healing),
-                fmt_int(p.interrupts),
-                fmt_int(p.deaths),
-            ), tags=(self._class_tag(p.cls),))
+            color = CLASS_COLORS.get(p.cls) or "#3a6ea5"
+            rows.append({
+                "name": {"text": p.name or p.guid, "color": color},
+                "ilvl": {"text": f"{p.info.ilvl:.0f}" if (p.info and p.info.ilvl) else "—"},
+                "class": {"text": p.cls or "—", "color": color},
+                "spec": {"text": p.spec or ""},
+                "damage": {"text": fmt_int(p.damage), "bar": p.damage,
+                           "max": top_damage, "color": color},
+                "dps": {"text": fmt_int(p.dps)},
+                "share": {"text": f"{share:.1f} %"},
+                "healing": {"text": fmt_int(p.healing)},
+                "interrupts": {"text": fmt_int(p.interrupts)},
+                "deaths": {"text": fmt_int(p.deaths)},
+            })
+        self.group_table.set_rows(rows)
 
         # --- характеристики ---
         for item in self.tree_stats.get_children():
@@ -432,7 +626,6 @@ class DamageApp(ctk.CTk):
         color = CLASS_COLORS.get(cls)
         if color:
             try:
-                self.tree_group.tag_configure(tag, foreground=color)
                 self.tree_stats.tag_configure(tag, foreground=color)
             except Exception:
                 pass
@@ -519,20 +712,21 @@ class DamageApp(ctk.CTk):
             ws.column_dimensions[col].width = width
 
         ws2 = wb.create_sheet("Группа")
-        ws2.append(["Дата", "Подземелье", "Ключ", "Игрок", "Класс", "Специализация",
+        ws2.append(["Дата", "Подземелье", "Ключ", "Игрок", "iLvl", "Класс", "Специализация",
                     "Урон", "ДПС", "Доля (%)", "Исцеление", "Прерывания", "Смерти"])
         for c in ws2[1]:
             c.font = bold
         for r in self.runs:
             total = r.total_damage or 1
             for p in sorted(r.players.values(), key=lambda x: x.damage, reverse=True):
+                ilvl = round(p.info.ilvl) if (p.info and p.info.ilvl) else ""
                 ws2.append([
                     r.start.strftime("%d.%m.%Y %H:%M") if r.start else "", r.zone,
-                    r.key_level or "", p.name or p.guid, p.cls, p.spec,
+                    r.key_level or "", p.name or p.guid, ilvl, p.cls, p.spec,
                     p.damage, round(p.dps), round(100.0 * p.damage / total, 1),
                     p.healing, p.interrupts, p.deaths,
                 ])
-        for col, width in zip("ABCDEFGHIJKL", (16, 30, 8, 18, 18, 20, 14, 10, 10, 14, 12, 10)):
+        for col, width in zip("ABCDEFGHIJKLM", (16, 30, 8, 18, 8, 18, 20, 14, 10, 10, 14, 12, 10)):
             ws2.column_dimensions[col].width = width
 
         ws3 = wb.create_sheet("Характеристики")

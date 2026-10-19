@@ -173,6 +173,14 @@ class Run:
     def is_dungeon(self) -> bool:
         return self.is_instance
 
+    @property
+    def is_empty(self) -> bool:
+        """Заход без единого события — остаётся от служебных смен зоны."""
+        if self.key_time_ms or self.boss_kills:
+            return False
+        return not any(p.damage or p.healing or p.interrupts or p.deaths
+                       for p in self.players.values())
+
 
 @dataclass
 class ParseResult:
@@ -384,13 +392,20 @@ class CombatLogParser:
                     continue
 
                 if event == "CHALLENGE_MODE_END":
+                    vals = [to_int(x) for x in a[1:4]] if len(a) > 1 else [0, 0, 0]
+                    if not any(vals):
+                        # сброс ключа без данных (например, пересоздание группы):
+                        # закрывать заход нельзя, иначе остаётся пустая строка
+                        if cur is not None:
+                            cur.key_success = None
+                            cur.key_time_ms = None
+                        continue
                     if cur is None:
                         cur = Run(zone=cur_zone or "Неизвестно", start=ts)
-                    cur.key_success = (to_int(a[1]) == 1) if len(a) > 1 else None
-                    if len(a) > 2 and to_int(a[2]):
-                        cur.key_level = to_int(a[2])
-                    if len(a) > 3:
-                        cur.key_time_ms = to_int(a[3])
+                    cur.key_success = vals[0] == 1
+                    if vals[1]:
+                        cur.key_level = vals[1]
+                    cur.key_time_ms = vals[2]
                     if len(a) > 4 and to_int(a[4]) > 60_000:
                         cur.timer_limit = to_int(a[4]) // 1000
                     cur.timer_limit = cur.timer_limit or dungeon_timer(cur.zone)
@@ -509,7 +524,7 @@ class CombatLogParser:
                 if not p.name:
                     p.name = res.players.get(p.guid, "")
 
-        res.runs = [r for r in runs if r.players]
+        res.runs = [r for r in runs if r.players and not r.is_empty]
 
         totals: dict[str, int] = defaultdict(int)
         for run in res.runs:
