@@ -16,10 +16,34 @@ app.result = res
 app._refresh_runs()
 app.update()
 
-rows = app.tree_runs.get_children()
+# ---- список заходов ----
+rows = app.runs_table.rows
 print("RUN ROWS:", len(rows))
-for iid in rows:
-    print("  ", app.tree_runs.item(iid, "values"))
+for i in range(min(6, len(rows))):
+    print("  ", app.runs_table.row_values(i))
+print("RUN HEADERS:", [c["title"] for c in app.runs_table.columns])
+
+# у каждой строки есть цвет по уровню ключа, а участники — цветные фрагменты
+from gui import KEY_COLOR_BLACK, key_level_color  # noqa: E402
+for i, run in enumerate(app.runs):
+    assert rows[i]["bg"] == key_level_color(run.key_level), "цвет строки = цвет ключа"
+names = rows[0]["players"]
+if isinstance(names, dict):
+    assert "parts" in names, "имена участников должны быть цветными фрагментами"
+    texts = [p["text"] for p in names["parts"]]
+    colors = {p["color"] for p in names["parts"] if p["text"] != ", "}
+    print("NAMES:", texts)
+    assert texts.count(", ") == (len(texts) - 1) // 2 or len(texts) == 1, "имена через запятую"
+    assert len(colors) >= 1, "у имён должен быть цвет класса"
+
+# уровень ключа -> цвет: M0 синий, +2 зелёный, +20 красный, >20 чёрный
+print("KEY COLORS:", {lv: key_level_color(lv) for lv in (0, 2, 11, 20, 25)})
+assert key_level_color(0) != key_level_color(2), "M0 и +2 различаются"
+assert key_level_color(25) == KEY_COLOR_BLACK, "выше +20 — чёрный"
+
+# ---- выбранный заход сразу показан в деталях ----
+assert app.runs_table.selected == 0, "первый заход выбран"
+assert app.tree_stats.get_children(), "детали группы заполнены"
 
 print("GROUP ROWS:", len(app.group_table.rows))
 for i in range(min(3, len(app.group_table.rows))):
@@ -51,12 +75,14 @@ if len(ratios) > 1:
     dmg = [app.group_table.rows[i]["damage"]["bar"] for i in range(len(ratios))]
     assert abs(ratios[1] - round(dmg[1] / dmg[0] * 100, 1)) < 0.5, "доля полосы = доля урона"
 
-# ---- заголовок виден и содержит iLvl ----
+# ---- заголовок виден и содержит iLvl, но не содержит столбец «Класс» ----
 head_texts = [app.group_table.head_canvas.itemcget(i, "text")
               for i in app.group_table.head_canvas.find_all()
               if app.group_table.head_canvas.type(i) == "text"]
 print("HEADERS:", head_texts)
 assert "iLvl" in head_texts, "в заголовке должен быть столбец iLvl"
+assert "Класс" not in head_texts, "столбец «Класс» убран — класс виден по цвету имени"
+assert "Специализация" in head_texts, "в заголовке должна быть специализация"
 
 print("OK")
 app.destroy()

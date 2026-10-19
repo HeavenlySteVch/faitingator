@@ -36,6 +36,35 @@ def contrast_text(color: str) -> str:
     return "#101010" if lum > 0.6 else "#ffffff"
 
 
+def hsv_hex(hue: float, sat: float, val: float) -> str:
+    """Цвет из HSV (hue в градусах) — для плавного перехода между оттенками."""
+    import colorsys
+    r, g, b = colorsys.hsv_to_rgb((hue % 360) / 360.0, sat, val)
+    return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+# Цвет строки захода по уровню ключа: M0 — синий, +2 — зелёный,
+# дальше через жёлтый к красному (+20), ключи выше — чёрные.
+KEY_COLOR_M0 = hsv_hex(215, 0.75, 0.55)
+KEY_COLOR_2 = hsv_hex(120, 0.70, 0.50)
+KEY_COLOR_BLACK = "#000000"
+
+
+def key_level_color(level) -> str:
+    """Цвет строки подземелья по уровню ключа (None — обычный инст, M0)."""
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        level = 0
+    if level <= 0:
+        return KEY_COLOR_M0
+    if level > 20:
+        return KEY_COLOR_BLACK
+    if level <= 2:
+        return KEY_COLOR_2
+    return hsv_hex(120.0 * (1.0 - (level - 2) / 18.0), 0.80, 0.58)
+
+
 # ----------------------------------------------------------------------------
 # Таблица с полосами (canvas)
 # ----------------------------------------------------------------------------
@@ -50,8 +79,10 @@ class BarTable:
     ROW_H = 24
     HEAD_H = 28
 
-    def __init__(self, parent, columns):
+    def __init__(self, parent, columns, on_select=None):
         self.columns = columns
+        self.on_select = on_select
+        self.selected = -1
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True)
         frame.rowconfigure(1, weight=1)
@@ -80,6 +111,7 @@ class BarTable:
 
         self.canvas.bind("<Configure>", lambda _e: self.redraw())
         self.head_canvas.bind("<Configure>", lambda _e: self._draw_header())
+        self.canvas.bind("<Button-1>", self._on_click)
         for widget in (self.canvas, self.head_canvas):
             widget.bind("<MouseWheel>", self._on_wheel)
             widget.bind("<Shift-MouseWheel>", self._on_wheel_x)
@@ -87,6 +119,7 @@ class BarTable:
     # ------------------------------------------------------------------
     def set_rows(self, rows: list[dict]) -> None:
         self.rows = rows
+        self.selected = -1
         self.canvas.yview_moveto(0.0)
         self.redraw()
 
@@ -99,13 +132,23 @@ class BarTable:
         out = []
         for col in self.columns:
             cell = row.get(col["key"], "")
-            if isinstance(cell, dict):
+            if isinstance(cell, dict) and "parts" in cell:
+                out.append("".join(str(p.get("text", "")) for p in cell["parts"]))
+            elif isinstance(cell, dict):
                 out.append(str(cell.get("text", "")))
             else:
                 out.append(str(cell))
         return out
 
     # ------------------------------------------------------------------
+    def _on_click(self, event):
+        index = int(self.canvas.canvasy(event.y) // self.ROW_H)
+        if 0 <= index < len(self.rows):
+            self.selected = index
+            self.redraw()
+            if self.on_select:
+                self.on_select(index)
+
     def _on_wheel(self, event):
         self.canvas.yview_scroll(-int(event.delta / 120), "units")
         return "break"
@@ -166,19 +209,32 @@ class BarTable:
 
         for i, row in enumerate(self.rows):
             y = i * self.ROW_H
-            if i % 2:
+            bg = row.get("bg")
+            if bg is None and i % 2:
+                bg = "#303030"
+            if bg:
                 self.canvas.create_rectangle(0, y, visible_w, y + self.ROW_H,
-                                             fill="#303030", width=0, tags="rowbg")
+                                             fill=bg, width=0, tags="rowbg")
+            base = contrast_text(bg) if bg else "#e6e6e6"
             for (x, w), col in zip(xs, self.columns):
                 self._draw_cell(row.get(col["key"], ""), x, w, y,
-                                col.get("anchor", "w"))
+                                col.get("anchor", "w"), base)
+            if i == self.selected:
+                self.canvas.create_rectangle(0, y, visible_w, y + self.ROW_H,
+                                             outline="#7fb2ff", width=1,
+                                             tags="sel")
 
-    def _draw_cell(self, cell, x: int, w: int, y: int, anchor: str) -> None:
+    def _draw_cell(self, cell, x: int, w: int, y: int, anchor: str,
+                   base_color: str = "#e6e6e6") -> None:
         if not isinstance(cell, dict):
             cell = {"text": cell}
         text = str(cell.get("text", ""))
         value = cell.get("bar")
-        color = cell.get("color") or "#3a6ea5"
+        color = cell.get("color") or base_color
+
+        if "parts" in cell:
+            self._draw_parts(cell["parts"], x, w, y)
+            return
 
         if value is None:
             tx, ta = self._text_x(x, w, anchor)
@@ -202,6 +258,27 @@ class BarTable:
             self.canvas.create_text(x + w - 8, y + self.ROW_H / 2, text=text,
                                     anchor="e", fill=contrast_text(color),
                                     font=self.font)
+
+    def _draw_parts(self, parts: list, x: int, w: int, y: int) -> None:
+        """Несколько цветных фрагментов в одной ячейке (например, имена игроков)."""
+        cx = x + 8
+        limit = x + w - 8
+        ellipsis = "…"
+        for part in parts:
+            text = str(part.get("text", ""))
+            if not text:
+                continue
+            color = part.get("color") or "#e6e6e6"
+            if cx + self.font.measure(text) > limit:
+                while text and cx + self.font.measure(text + ellipsis) > limit:
+                    text = text[:-1]
+                if text:
+                    self.canvas.create_text(cx, y + self.ROW_H / 2, text=text + ellipsis,
+                                            anchor="w", fill=color, font=self.font)
+                return
+            self.canvas.create_text(cx, y + self.ROW_H / 2, text=text,
+                                    anchor="w", fill=color, font=self.font)
+            cx += self.font.measure(text)
 
 
 def fmt_duration(td) -> str:
@@ -300,20 +377,18 @@ class DamageApp(ctk.CTk):
         paned.add(bottom_frame, weight=3)
 
         # ================= заходы =================
-        cols = ("date", "zone", "key", "bonus", "time", "limit", "group", "damage")
-        heads = ("Дата", "Подземелье", "Ключ", "Результат", "Время",
-                 "Таймер", "Группа", "Урон группы")
-        widths = (110, 300, 70, 90, 90, 90, 80, 140)
-        self.tree_runs = ttk.Treeview(top_frame, columns=cols, show="headings")
-        for c, h, w in zip(cols, heads, widths):
-            self.tree_runs.heading(c, text=h)
-            anchor = "w" if c == "zone" else "center"
-            self.tree_runs.column(c, width=w, anchor=anchor, stretch=(c == "zone"))
-        self.tree_runs.pack(fill="both", expand=True, side="left")
-        self.tree_runs.bind("<<TreeviewSelect>>", self._on_run_select)
-        sb = ttk.Scrollbar(top_frame, orient="vertical", command=self.tree_runs.yview)
-        self.tree_runs.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
+        runs_cols = [
+            {"key": "date", "title": "Дата", "width": 110, "anchor": "center"},
+            {"key": "zone", "title": "Подземелье", "width": 168, "anchor": "w"},
+            {"key": "players", "title": "Игроки в группе", "width": 400,
+             "anchor": "w", "stretch": True},
+            {"key": "key", "title": "Ключ", "width": 60, "anchor": "center"},
+            {"key": "bonus", "title": "Результат", "width": 84, "anchor": "center"},
+            {"key": "time", "title": "Время", "width": 76, "anchor": "center"},
+            {"key": "limit", "title": "Таймер", "width": 76, "anchor": "center"},
+            {"key": "damage", "title": "Урон группы", "width": 116, "anchor": "center"},
+        ]
+        self.runs_table = BarTable(top_frame, runs_cols, on_select=self._on_run_row)
 
         # ================= детали =================
         self.tabs = ctk.CTkTabview(bottom_frame)
@@ -328,8 +403,7 @@ class DamageApp(ctk.CTk):
         gcols = [
             {"key": "name", "title": "Игрок", "width": 160, "anchor": "w", "stretch": True},
             {"key": "ilvl", "title": "iLvl", "width": 60, "anchor": "center"},
-            {"key": "class", "title": "Класс", "width": 130, "anchor": "w"},
-            {"key": "spec", "title": "Специализация", "width": 150, "anchor": "w"},
+            {"key": "spec", "title": "Специализация", "width": 170, "anchor": "w"},
             {"key": "damage", "title": "Урон", "width": 200, "anchor": "e"},
             {"key": "dps", "title": "ДПС", "width": 90, "anchor": "center"},
             {"key": "share", "title": "Доля", "width": 80, "anchor": "center"},
@@ -428,11 +502,14 @@ class DamageApp(ctk.CTk):
             "   Читать можно, пока игра запущена.\n\n"
             "Что показывается\n"
             "================\n"
-            "• Заходы: дата, подземелье, уровень ключа, результат (+1/+2/+3),\n"
-            "  время прохождения и таймер подземелья.\n"
-            "• Группа: кто был в группе, уровень предметов, класс и специализация,\n"
-            "  урон (полоса заполняется по доле от лучшего игрока), ДПС, доля\n"
-            "  от общего урона, исцеление, прерывания, смерти.\n"
+            "• Заходы: дата, подземелье, участники (имена цветом класса), уровень\n"
+            "  ключа, результат (+1/+2/+3), время и таймер. Строка красится по\n"
+            "  уровню ключа: M0 — синий, +2 — зелёный, дальше плавно к красному\n"
+            "  (+20), ключи выше 20 — чёрные.\n"
+            "• Группа: кто был в группе, уровень предметов и специализация\n"
+            "  (класс виден по цвету имени), урон (полоса заполняется по доле от\n"
+            "  лучшего игрока), ДПС, доля от общего урона, исцеление, прерывания,\n"
+            "  смерти.\n"
             "• Характеристики: уровень предметов, сила, ловкость, выносливость,\n"
             "  интеллект, броня, крит, скорость, искусность, универсальность.\n"
             "• Способности: разбивка урона выбранного игрока по способностям.\n\n"
@@ -509,9 +586,8 @@ class DamageApp(ctk.CTk):
 
     # ------------------------------------------------------------------
     def _refresh_runs(self) -> None:
-        for item in self.tree_runs.get_children():
-            self.tree_runs.delete(item)
         if self.result is None:
+            self.runs_table.clear()
             return
 
         text = self.search.get().strip().lower()
@@ -525,28 +601,48 @@ class DamageApp(ctk.CTk):
         runs.sort(key=lambda r: r.start.timestamp() if r.start else 0, reverse=True)
         self.runs = runs
 
+        rows = []
         for run in runs:
-            self.tree_runs.insert(
-                "", "end", iid=str(id(run)),
-                values=(
-                    fmt_date(run.start),
-                    run.zone,
-                    f"+{run.key_level}" if run.key_level else "",
-                    run.bonus,
-                    fmt_duration(run.duration) if (run.key_time_ms or run.end) else "",
-                    fmt_duration(run.timer_limit) if run.timer_limit else "",
-                    run.group_size or len(run.players),
-                    fmt_int(run.total_damage),
-                ))
+            rows.append({
+                "bg": key_level_color(run.key_level),
+                "date": fmt_date(run.start),
+                "zone": run.zone,
+                "players": self._players_cell(run),
+                "key": f"+{run.key_level}" if run.key_level else "",
+                "bonus": run.bonus,
+                "time": fmt_duration(run.duration) if (run.key_time_ms or run.end) else "",
+                "limit": fmt_duration(run.timer_limit) if run.timer_limit else "",
+                "damage": fmt_int(run.total_damage),
+            })
+        self.runs_table.set_rows(rows)
 
         if runs:
-            first = str(id(runs[0]))
-            self.tree_runs.selection_set(first)
-            self.tree_runs.focus(first)
-            self._on_run_select()
+            self.runs_table.selected = 0
+            self.runs_table.redraw()
+            self._on_run_row(0)
         else:
             self.current_run = None
             self._clear_details()
+
+    def _players_cell(self, run: Run) -> dict:
+        """Имена участников захода, каждое — цветом класса."""
+        players = [p for p in run.players.values() if p.damage or p.healing or p.interrupts]
+        players.sort(key=lambda p: p.damage, reverse=True)
+        parts = []
+        for p in players:
+            if parts:
+                parts.append({"text": ", ", "color": "#9a9a9a"})
+            parts.append({"text": p.name or p.guid,
+                          "color": CLASS_COLORS.get(p.cls) or "#d0d0d0"})
+        if not parts:
+            return {"text": "—"}
+        return {"parts": parts}
+
+    def _on_run_row(self, index: int) -> None:
+        if not (0 <= index < len(self.runs)):
+            return
+        self.current_run = self.runs[index]
+        self._show_run(self.current_run)
 
     # ------------------------------------------------------------------
     def _clear_details(self) -> None:
@@ -557,15 +653,7 @@ class DamageApp(ctk.CTk):
         self.ability_player.configure(values=["—"])
         self.ability_player.set("—")
 
-    def _on_run_select(self, _event=None) -> None:
-        sel = self.tree_runs.selection()
-        if not sel:
-            return
-        run = next((r for r in self.runs if str(id(r)) == sel[0]), None)
-        if run is None:
-            return
-        self.current_run = run
-
+    def _show_run(self, run: Run) -> None:
         # --- группа ---
         total = run.total_damage or 1
         players = sorted(run.players.values(), key=lambda p: p.damage, reverse=True)
@@ -577,7 +665,6 @@ class DamageApp(ctk.CTk):
             rows.append({
                 "name": {"text": p.name or p.guid, "color": color},
                 "ilvl": {"text": f"{p.info.ilvl:.0f}" if (p.info and p.info.ilvl) else "—"},
-                "class": {"text": p.cls or "—", "color": color},
                 "spec": {"text": p.spec or ""},
                 "damage": {"text": fmt_int(p.damage), "bar": p.damage,
                            "max": top_damage, "color": color},

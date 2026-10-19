@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from classes import SPECS, class_by_spec, dungeon_timer, guess_class
+from classes import SPECS, class_by_spec, dungeon_timer, guess_class, refine_spec
 
 # ----------------------------------------------------------------------------
 # Константы
@@ -50,6 +50,10 @@ TIME_RE = re.compile(r"^(\d+)/(\d+)\s+(\d+):(\d+):(\d+)\.(\d+)")
 GEAR_ITEM_RE = re.compile(r"\((\d+),(\d+),")
 NIL_GUIDS = {"", "0000000000000000", "0", "nil"}
 SPEC_IDS = set(SPECS.keys())
+# COMBATLOG_OBJECT_TYPE_PLAYER: цель урона — персонаж (самоурон «Пошатывания» и т.п.)
+FLAG_PLAYER = 0x400
+# Ауры, по которым восстанавливается связь «питомец -> владелец».
+AURA_EVENTS = ("SPELL_AURA_APPLIED", "SPELL_AURA_REFRESH", "SPELL_AURA_APPLIED_DOSE")
 
 
 # ----------------------------------------------------------------------------
@@ -99,6 +103,7 @@ class PlayerRun:
     spell_ids: dict = field(default_factory=dict)
     cls: str = ""
     spec: str = ""
+    spec_id: int = 0
     info: CombatantInfo | None = None
 
     @property
@@ -254,6 +259,14 @@ def to_int(value: str, default: int = 0) -> int:
             return default
 
 
+def to_flags(value: str) -> int:
+    """Флаги события вида 0x511 -> число."""
+    try:
+        return int(value, 16)
+    except (TypeError, ValueError):
+        return 0
+
+
 def gear_ilvls(field_value: str) -> list[int]:
     """Уровни предметов из поля экипировки COMBATANT_INFO.
 
@@ -296,6 +309,11 @@ class CombatLogParser:
         runs: list[Run] = []
         names: dict[str, str] = {}
         pets_of: dict[str, str] = {}
+        # урон питомцев, владелец которых определится позже (по аурам)
+        pending_pets: dict[str, list] = {}
+        # (источник, способность) -> цели: нужна для поиска «своих» питомцев
+        aura_dests: dict[tuple[str, int], set[str]] = {}
+        aura_on_players: set[tuple[str, int]] = set()
         cur: Run | None = None
         cur_zone = ""
 
@@ -332,6 +350,27 @@ class CombatLogParser:
                     cur.end = cur.start
                 runs.append(cur)
                 cur = None
+
+        def credit(run: Run, guid: str, name: str, amount: int, event: str,
+                   a: list[str], adv: bool, amount_idx: int, ts: datetime) -> None:
+            """Начисляет урон/исцеление игроку."""
+            p = get_player(run, guid, name)
+            if event in DAMAGE_EVENTS:
+                p.damage += amount
+                ability = self._ability_name(a, event)
+                st = p.abilities.get(ability)
+                if st is None:
+                    st = AbilityStat(ability)
+                    p.abilities[ability] = st
+                st.damage += amount
+                st.hits += 1
+                if self._is_crit(a, event, adv, amount_idx):
+                    st.crits += 1
+                if amount > st.max_hit:
+                    st.max_hit = amount
+            else:
+                p.healing += amount
+            p.active.add(int(ts.timestamp()))
 
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for lineno, raw in enumerate(fh, 1):
@@ -464,36 +503,35 @@ class CombatLogParser:
                         continue
                     src_name = clean_name(a[1] if len(a) > 1 else "")
                     adv, amount_idx = self._layout(a, event)
+                    amount = to_int(a[amount_idx]) if len(a) > amount_idx else 0
+                    if amount <= 0:
+                        continue
+                    # урон по игроку — это полученный урон (например, «Пошатывание»
+                    # хмелевара), а не нанесённый: в зачёт он не идёт
+                    if event in DAMAGE_EVENTS and len(a) > 6 and to_flags(a[6]) & FLAG_PLAYER:
+                        continue
 
                     owner = pets_of.get(src_guid, "")
                     if owner:
                         src_guid = owner
                         src_name = ""
-
                     if not src_guid.startswith("Player-"):
+                        if src_guid.startswith("Pet-"):
+                            # владелец питомца может выясниться позже (по аурам)
+                            pending_pets.setdefault(src_guid, []).append(
+                                (cur, src_name, amount, event, a, adv, amount_idx, ts))
                         continue
 
-                    p = get_player(cur, src_guid, src_name)
-                    amount = to_int(a[amount_idx]) if len(a) > amount_idx else 0
-                    if amount <= 0:
-                        continue
+                    credit(cur, src_guid, src_name, amount, event, a, adv, amount_idx, ts)
+                    continue
 
-                    if event in DAMAGE_EVENTS:
-                        p.damage += amount
-                        ability = self._ability_name(a, event)
-                        st = p.abilities.get(ability)
-                        if st is None:
-                            st = AbilityStat(ability)
-                            p.abilities[ability] = st
-                        st.damage += amount
-                        st.hits += 1
-                        if self._is_crit(a, event, adv, amount_idx):
-                            st.crits += 1
-                        if amount > st.max_hit:
-                            st.max_hit = amount
-                    else:
-                        p.healing += amount
-                    p.active.add(int(ts.timestamp()))
+                # ---------- ауры: связь «питомец -> владелец» ----------
+                if event in AURA_EVENTS:
+                    if len(a) > 8 and a[0].startswith("Player-") and a[4]:
+                        key = (a[0], to_int(a[8]))
+                        aura_dests.setdefault(key, set()).add(a[4])
+                        if a[4].startswith("Player-"):
+                            aura_on_players.add(key)
                     continue
 
                 # ---------- касты (для определения класса без COMBATANT_INFO) ----------
@@ -505,6 +543,27 @@ class CombatLogParser:
                             p.spell_ids[sid] = p.spell_ids.get(sid, 0) + 1
 
         close_current()
+
+        # ---------- питомцы, владелец которых выяснился по аурам ----------
+        # «Своя» аура питомца накладывается только на него (например, «Тёмное
+        # превращение» рыцаря смерти). Баффы и хоты лекарей тоже висят на
+        # питомцах, поэтому такие способности исключаем: их накладывают и на игроков.
+        pet_candidates: dict[str, set[str]] = {}
+        for (owner_guid, spell_id), targets in aura_dests.items():
+            if (owner_guid, spell_id) in aura_on_players:
+                continue
+            for target in targets:
+                if target.startswith("Pet-"):
+                    pet_candidates.setdefault(target, set()).add(owner_guid)
+        for pet_guid, events in pending_pets.items():
+            owner = pets_of.get(pet_guid, "")
+            if not owner:
+                cands = pet_candidates.get(pet_guid) or set()
+                owner = next(iter(cands)) if len(cands) == 1 else ""
+            if not owner:
+                continue
+            for run_obj, name, amount, event, a, adv, amount_idx, ts in events:
+                credit(run_obj, owner, "", amount, event, a, adv, amount_idx, ts)
 
         # ---------- финализация ----------
         res.players.update(names)
@@ -519,10 +578,23 @@ class CombatLogParser:
                 if p.info is not None:
                     p.cls = p.info.cls or p.cls
                     p.spec = p.info.spec or p.spec
+                    p.spec_id = p.info.spec_id or p.spec_id
                 if not p.cls:
                     p.cls = guess_class(p.spell_ids)
+                # в логе Firestorm лежит лут-спек — уточняем по способностям
+                p.spec_id = refine_spec(p.cls, p.spec_id, p.spell_ids)
+                if p.spec_id:
+                    p.spec = class_by_spec(p.spec_id)[1]
                 if not p.name:
                     p.name = res.players.get(p.guid, "")
+
+            # «прохожие»: в заход попали (например, что-то кастовали рядом),
+            # но ни урона, ни лечения, ни прерываний, ни смертей, ни данных
+            # COMBATANT_INFO о них нет — в отчёте они только мешают
+            for stray in [g for g, pl in run.players.items()
+                          if not (pl.damage or pl.healing or pl.interrupts
+                                  or pl.deaths or pl.info is not None)]:
+                del run.players[stray]
 
         res.runs = [r for r in runs if r.players and not r.is_empty]
 
@@ -623,7 +695,12 @@ class CombatLogParser:
         if best_field:
             levels = gear_ilvls(best_field)
             if levels:
-                info.ilvl = round(sum(levels) / len(levels), 1)
+                # Игра не учитывает рубашку и табард (у табардов BfA iLvl 120),
+                # поэтому отбрасываем предметы, чей уровень резко ниже остальных:
+                # иначе средний iLvl (359.7 у мага в 385-м гире) расходится с игрой.
+                top = max(levels)
+                kept = [lv for lv in levels if lv >= top * 0.5] or levels
+                info.ilvl = round(sum(kept) / len(kept), 1)
 
         return info
 
