@@ -1,0 +1,9 @@
+## Interface: 80300
+## Title: AutoCombatLog
+## Notes: Автоматически включает запись боевого журнала (вместо /combatlog)
+## Notes-enUS: Automatically enables combat logging on login (no /combatlog needed)
+## Version: 1.0
+## Author: faitingator
+## X-Category: Data Export
+## SavedVariables: AutoCombatLogDB
+AutoCombatLog.lua

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import shutil
 import threading
 import traceback
 import tkinter as tk
@@ -38,10 +39,14 @@ ACCENT = "#4f8cf7"
 ACCENT_HOVER = "#3d78de"
 CARD_2_HOVER = "#323a46"
 WARN = "#e0a33a"
+OK = "#7ec27e"
 LEADER = "#ffd479"
 
 FONT = "Segoe UI"
 FONT_NUM = "Consolas"
+
+# Аддон автозаписи боевого журнала (лежит в репозитории, копируется в игру)
+ADDON_SRC = Path(__file__).resolve().parent / "addon" / "AutoCombatLog"
 
 
 def _rgb(color: str) -> tuple[int, int, int]:
@@ -671,14 +676,25 @@ class DamageApp(ctk.CTk):
         self.tree_ab = self._make_tree(tab_ab, acols, aheads, awidths, num_from=1)
 
         # --- инфо ---
+        addon_row = ctk.CTkFrame(tab_info, fg_color="transparent")
+        addon_row.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
+        self.addon_status = ctk.CTkLabel(addon_row, text="", font=("Segoe UI", 10),
+                                         text_color=TEXT_DIM)
+        self.addon_status.pack(side="left", padx=(4, 12))
+        ctk.CTkButton(addon_row, text="Установить автозапись журнала", width=250,
+                      height=30, corner_radius=8, command=self._install_addon,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#ffffff",
+                      font=("Segoe UI", 11, "bold")).pack(side="right")
+
         self.info_box = ctk.CTkTextbox(tab_info, wrap="word", corner_radius=8,
                                        fg_color=TABLE_BG, border_width=0,
                                        text_color=TEXT_DIM, font=("Segoe UI", 11),
                                        scrollbar_button_color=CARD_2,
                                        scrollbar_button_hover_color=CARD_2_HOVER)
-        self.info_box.pack(fill="both", expand=True, padx=8, pady=8)
+        self.info_box.pack(fill="both", expand=True, padx=8, pady=(8, 4))
         self.info_box.insert("1.0", self._info_text())
         self.info_box.configure(state="disabled")
+        self._update_addon_status()
 
         # ---- нижняя панель ----
         bottom = self._card(self)
@@ -756,14 +772,20 @@ class DamageApp(ctk.CTk):
         return (
             "Как получить данные\n"
             "====================\n\n"
-            "1. Включи запись боевого журнала — один раз в игре:\n"
-            "      /combatlog\n\n"
-            "2. Включи расширенное логирование (нужно для классов и характеристик):\n"
+            "1. Включи расширенное логирование (нужно для классов и характеристик):\n"
             "      /console advancedCombatLogging 1\n\n"
-            "3. Пройди подземелье (ключ, рейд, обычный инст).\n\n"
-            "4. В приложении нажми «Загрузить» (или F5). Файл журнала:\n"
+            "2. Пройди подземелье (ключ, рейд, обычный инст).\n\n"
+            "3. В приложении нажми «Загрузить» (или F5). Файл журнала:\n"
             "      <папка игры>\\Logs\\WoWCombatLog.txt\n"
             "   Читать можно, пока игра запущена.\n\n"
+            "Запись журнала (/combatlog)\n"
+            "===========================\n"
+            "Команда /combatlog действует только до выхода из игры — клиент не\n"
+            "сохраняет эту настройку, поэтому её приходится вводить каждый раз.\n\n"
+            "Чтобы не вводить команду: кнопка «Установить автозапись журнала»\n"
+            "ниже копирует в игру маленький аддон (папка addon\\AutoCombatLog\n"
+            "в репозитории). После перезапуска игры аддон сам включает запись\n"
+            "при входе. Проверка в игре — команда /acl.\n\n"
             "Что показывается\n"
             "================\n"
             "• Заходы: дата, подземелье, участники (имена цветом класса), уровень\n"
@@ -808,6 +830,74 @@ class DamageApp(ctk.CTk):
             filetypes=[("Combat log", "*.txt"), ("Все файлы", "*.*")])
         if path:
             self.log_path.set(path)
+            self._update_addon_status()
+
+    # ------------------------------------------------------------------
+    # Аддон автозаписи журнала
+    # ------------------------------------------------------------------
+    def _game_addons_dir(self) -> Path | None:
+        """Папка Interface\\AddOns игры, выведенная из пути к журналу."""
+        raw = self.log_path.get().strip()
+        if not raw:
+            return None
+        log = Path(raw)
+        if log.name.lower().endswith(".txt"):   # ...\<игра>\Logs\WoWCombatLog.txt
+            root = log.parent.parent
+            if any((root / marker).exists() for marker in ("Wow.exe", "Interface", "Data", "WTF")):
+                return root / "Interface" / "AddOns"
+        return None
+
+    def _update_addon_status(self, note: str = "") -> None:
+        target = self._game_addons_dir()
+        if target is None:
+            text = "автозапись журнала: путь к игре не распознан"
+            color = TEXT_MUTED
+        elif (target / ADDON_SRC.name / "AutoCombatLog.toc").exists():
+            text = "автозапись журнала: аддон установлен"
+            color = OK
+        else:
+            text = "автозапись журнала: аддон не установлен"
+            color = WARN
+        if note:
+            text += " · " + note
+        self.addon_status.configure(text=text, text_color=color)
+
+    def _install_addon(self) -> None:
+        target = self._game_addons_dir()
+        if target is None:
+            messagebox.showerror(
+                "Не нашёл папку игры",
+                "Не удалось определить папку игры по пути к журналу.\n"
+                "Проверь путь к WoWCombatLog.txt (кнопка «Обзор») — он должен "
+                "лежать в <папка игры>\\Logs\\.")
+            return
+        if not ADDON_SRC.is_dir():
+            messagebox.showerror("Нет файлов аддона",
+                                 f"Не найден каталог аддона:\n{ADDON_SRC}")
+            return
+        dest = target / ADDON_SRC.name
+        if dest.exists() and not messagebox.askyesno(
+                "Переустановить аддон?",
+                f"Аддон уже лежит здесь:\n{dest}\n\nЗаменить файлы?"):
+            return
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            for src in sorted(ADDON_SRC.iterdir()):
+                if src.is_file():
+                    shutil.copy2(src, dest / src.name)
+        except OSError as exc:
+            messagebox.showerror("Не удалось установить аддон",
+                                 f"{dest}\n\n{exc}")
+            return
+        self._update_addon_status(note="перезапусти игру")
+        messagebox.showinfo(
+            "Аддон установлен",
+            "Аддон автозаписи скопирован в игру:\n"
+            f"{dest}\n\n"
+            "Полностью перезапусти игру (новые аддоны подхватываются при "
+            "запуске) — запись боевого журнала будет включаться сама, "
+            "/combatlog вводить больше не нужно.\n\n"
+            "Проверка в игре: команда /acl покажет состояние записи.")
 
     # ------------------------------------------------------------------
     def _start_parse(self) -> None:
@@ -819,6 +909,7 @@ class DamageApp(ctk.CTk):
         self.btn_load.configure(state="disabled", text="Чтение...")
         self.progress.set(0)
         self.status.configure(text="Чтение лога...", text_color=WARN)
+        self._update_addon_status()
         threading.Thread(target=self._parse_worker, args=(path,), daemon=True).start()
 
     def _parse_worker(self, path: str) -> None:
