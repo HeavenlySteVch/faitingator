@@ -108,14 +108,19 @@ class PlayerRun:
     spec: str = ""
     spec_id: int = 0
     info: CombatantInfo | None = None
+    # знаменатель для ДПС/ХПС: общее время захода (одинаковое для всех),
+    # иначе у игроков с редкими «всплесками» ДПС искусственно завышается
+    time_base: float = 0.0
 
     @property
     def dps(self) -> float:
-        return self.damage / len(self.active) if self.active else 0.0
+        t = self.time_base or len(self.active)
+        return self.damage / t if t else 0.0
 
     @property
     def hps(self) -> float:
-        return self.healing / len(self.active) if self.active else 0.0
+        t = self.time_base or len(self.active)
+        return self.healing / t if t else 0.0
 
 
 @dataclass
@@ -140,8 +145,19 @@ class Run:
         if self.key_time_ms:
             return timedelta(milliseconds=self.key_time_ms)
         if self.start and self.end:
-            return self.end - self.start
+            return timedelta(seconds=round((self.end - self.start).total_seconds()))
         return timedelta(0)
+
+    @property
+    def time_base(self) -> float:
+        """Реально прошедшее время захода (секунды) — знаменатель для ДПС/ХПС.
+
+        Берётся «настенное» время от старта ключа до финиша: штраф за смерти
+        (5 секунд), который игра прибавляет к таймеру, на скорость не влияет.
+        """
+        if self.key_start and self.end and self.end > self.key_start:
+            return (self.end - self.key_start).total_seconds()
+        return self.duration.total_seconds()
 
     @property
     def total_damage(self) -> int:
@@ -321,6 +337,7 @@ class CombatLogParser:
         aura_on_players: set[tuple[str, int]] = set()
         cur: Run | None = None
         cur_zone = ""
+        last_ts: datetime | None = None
 
         # Год в combat log не пишется — восстанавливаем по дате файла
         mtime = datetime.fromtimestamp(path.stat().st_mtime)
@@ -348,11 +365,11 @@ class CombatLogParser:
                 names[guid] = name
             return p
 
-        def close_current() -> None:
+        def close_current(end_ts: datetime | None = None) -> None:
             nonlocal cur
             if cur is not None:
                 if cur.end is None:
-                    cur.end = cur.start
+                    cur.end = end_ts or cur.start
                 runs.append(cur)
                 cur = None
 
@@ -393,6 +410,7 @@ class CombatLogParser:
                 if not tm:
                     continue
                 ts = timestamp(tm)
+                last_ts = ts
                 rest = line[tm.end():].lstrip()
                 if not rest:
                     continue
@@ -431,7 +449,7 @@ class CombatLogParser:
                     if (cur is not None and cur.zone == zone
                             and cur.instance_id == instance and cur.difficulty == difficulty):
                         continue
-                    close_current()
+                    close_current(ts)
                     cur_zone = zone
                     cur = Run(zone=zone, instance_id=instance, difficulty=difficulty, start=ts)
                     continue
@@ -442,7 +460,7 @@ class CombatLogParser:
                     cm_id = to_int(a[2]) if len(a) > 2 else 0
                     level = to_int(a[3]) if len(a) > 3 else 0
                     if cur is None or cur.zone != zone:
-                        close_current()
+                        close_current(ts)
                         cur = Run(zone=zone, instance_id=instance, start=ts)
                     cur.key_level = level or None
                     cur.instance_id = instance or cur.instance_id
@@ -481,7 +499,7 @@ class CombatLogParser:
                     if len(a) > 4 and to_int(a[4]) > 60_000:
                         cur.timer_limit = to_int(a[4]) // 1000
                     cur.timer_limit = cur.timer_limit or dungeon_timer(cur.zone, cur.cm_id)
-                    close_current()
+                    close_current(ts)
                     continue
 
                 if event == "ENCOUNTER_START":
@@ -576,7 +594,7 @@ class CombatLogParser:
                             p = get_player(cur, a[0], clean_name(a[1] if len(a) > 1 else ""))
                             p.spell_ids[sid] = p.spell_ids.get(sid, 0) + 1
 
-        close_current()
+        close_current(last_ts)
 
         # ---------- питомцы, владелец которых выяснился по аурам ----------
         # «Своя» аура питомца накладывается только на него (например, «Тёмное
@@ -612,6 +630,7 @@ class CombatLogParser:
                 if guid in run.players and run.players[guid].info is None:
                     run.players[guid].info = info
             for p in run.players.values():
+                p.time_base = run.time_base
                 if p.info is not None:
                     p.cls = p.info.cls or p.cls
                     p.spec = p.info.spec or p.spec
