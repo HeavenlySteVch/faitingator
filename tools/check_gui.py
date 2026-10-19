@@ -58,15 +58,32 @@ for iid in app.tree_ab.get_children()[:3]:
     print("  ", app.tree_ab.item(iid, "values"))
 
 # ---- проверка полос: у лучшего игрока заполнение 100% ----
+# Полоса заливается сегментами градиента (несколько объектов с тегом bar),
+# поэтому сегменты собираются по строке (по координате y).
 app.update()
 canvas = app.group_table.canvas
-tracks = [canvas.coords(i) for i in canvas.find_withtag("track")]
-fills = [canvas.coords(i) for i in canvas.find_withtag("bar")]
+row_h = app.group_table.ROW_H
+
+
+def row_index(coords):
+    return int(((coords[1] + coords[3]) / 2) // row_h)
+
+
+tracks = {}
+for i in canvas.find_withtag("track"):
+    x0, y0, x1, y1 = canvas.coords(i)
+    tracks[row_index((x0, y0, x1, y1))] = (x0, x1)
+fills = {}
+for i in canvas.find_withtag("bar"):
+    x0, y0, x1, y1 = canvas.coords(i)
+    lo, hi = fills.get(row_index((x0, y0, x1, y1)), (x0, x1))
+    fills[row_index((x0, y0, x1, y1))] = (min(lo, x0), max(hi, x1))
 assert len(tracks) == len(app.group_table.rows), "на каждого игрока должна быть полоса"
+assert sorted(tracks) == list(range(len(app.group_table.rows))), "полосы по порядку строк"
 ratios = []
-for t, f in zip(tracks, fills):
-    track_w = t[2] - t[0]
-    fill_w = f[2] - f[0]
+for i in sorted(tracks):
+    track_w = tracks[i][1] - tracks[i][0]
+    fill_w = (fills[i][1] - fills[i][0]) if i in fills else 0.0
     ratios.append(round(fill_w / track_w * 100, 1))
 print("BARS (% от лучшего):", ratios)
 assert ratios[0] == 100.0, "у лучшего игрока полоса должна быть заполнена целиком"
