@@ -13,6 +13,7 @@
 --   /acl on    — включить автозапись (по умолчанию включена)
 --   /acl off   — выключить автозапись
 --   /acl now   — включить запись прямо сейчас
+--   /acl loot  — сколько записей о добыче собрано
 
 local ADDON = "AutoCombatLog"
 
@@ -117,6 +118,51 @@ check = function(reason, announce)
     enableNow(announce)
 end
 
+-- ---------------------------------------------------------------------------
+-- Добыча
+-- ---------------------------------------------------------------------------
+-- В боевой журнал добыча не попадает, поэтому запоминаем её из чата:
+-- клиент присылает сообщение вида
+--   "Имя получает предмет: |cffa335ee|Hitem:174123::::::::60:250:::::|h[Название]|h|r"
+-- Приложение прочитает AutoCombatLogDB.loot и сопоставит записи с заходами
+-- по времени и подземелью.
+local MAX_LOOT = 400
+
+local function rememberLoot(text, player)
+    if type(text) ~= "string" then return end
+    local link = text:match("|c%x%x%x%x%x%x%x%x|Hitem:[^|]+|h%[[^%]]*%]|h")
+        or text:match("|Hitem:[^|]+|h%[[^%]]*%]|h")
+    if not link then return end
+    local id = tonumber(link:match("item:(%d+)"))
+    if not id then return end
+    local name = link:match("|h%[([^%]]*)%]") or ""
+    local _, _, quality, baseIlvl = GetItemInfo(id)
+    local ilvl = baseIlvl
+    if GetDetailedItemLevelInfo then
+        local ok, detailed = pcall(GetDetailedItemLevelInfo, link)
+        if ok and type(detailed) == "number" and detailed > 0 then ilvl = detailed end
+    end
+    db.loot = db.loot or {}
+    local list = db.loot
+    local now = time()
+    -- одно и то же сообщение иногда приходит дважды — не дублируем
+    local last = list[#list]
+    if last and last.id == id and last.p == (player or "") and (now - last.t) <= 3 then
+        return
+    end
+    list[#list + 1] = {
+        t = now,
+        p = player or "",
+        id = id,
+        n = name,
+        q = quality or 3,
+        ilvl = ilvl or 0,
+        z = (GetZoneText and GetZoneText()) or "",
+        i = select(8, GetInstanceInfo()) or 0,
+    }
+    while #list > MAX_LOOT do table.remove(list, 1) end
+end
+
 frame:SetScript("OnEvent", function(_, event, arg1)
     if event == "ADDON_LOADED" and arg1 == ADDON then
         AutoCombatLogDB = AutoCombatLogDB or {}
@@ -127,11 +173,14 @@ frame:SetScript("OnEvent", function(_, event, arg1)
         check("login", true)
     elseif event == "PLAYER_ENTERING_WORLD" then
         check("world", false)
+    elseif event == "CHAT_MSG_LOOT" then
+        rememberLoot(arg1, arg2)
     end
 end)
 frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+frame:RegisterEvent("CHAT_MSG_LOOT")
 
 local function status()
     if not apiOk() then return end
@@ -148,7 +197,8 @@ local function status()
     end
     local adv = GetCVar("advancedCombatLogging") == "1"
     msg(text .. "; расширенное логирование: " .. (adv and "вкл" or "выкл")
-        .. "; автозапись: " .. (db.enabled and "вкл" or "выкл"))
+        .. "; автозапись: " .. (db.enabled and "вкл" or "выкл")
+        .. "; добыча: " .. #(db.loot or {}) .. " записей")
 end
 
 SLASH_AUTOCOMBATLOG1 = "/acl"
@@ -165,6 +215,11 @@ SlashCmdList["AUTOCOMBATLOG"] = function(input)
     elseif input == "now" or input == "force" then
         knownOn = false
         check("force", true)
+    elseif input == "loot" then
+        local list = db.loot or {}
+        msg("добыча: " .. #list .. " записей; последняя — "
+            .. (list[#list] and (list[#list].n .. " (" .. (list[#list].p or "?") .. ")")
+                or "нет"))
     else
         status()
     end

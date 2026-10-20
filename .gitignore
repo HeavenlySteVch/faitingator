@@ -23,3 +23,6 @@ tools/sample_logs/*.txt
 Thumbs.db
 build/
 dist/
+
+# служебный предпросмотр иконки
+tools/icon_preview.png

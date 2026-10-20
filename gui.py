@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import shutil
+import sys
 import threading
 import traceback
 import tkinter as tk
@@ -17,7 +18,8 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 import customtkinter as ctk
 
 from classes import CLASS_COLORS
-from wow_damage_app import CombatLogParser, DEFAULT_LOG_PATHS, ParseResult, Run
+from wow_damage_app import (CombatLogParser, DEFAULT_LOG_PATHS, ParseResult, Run,
+                            attach_loot, load_loot)
 
 
 # ----------------------------------------------------------------------------
@@ -457,6 +459,7 @@ class DamageApp(ctk.CTk):
         self.geometry("1460x920")
         self.minsize(1180, 760)
         self.configure(fg_color=APP_BG)
+        self._set_window_icon()
 
         self.fonts = make_fonts()
         self.result: ParseResult | None = None
@@ -468,6 +471,33 @@ class DamageApp(ctk.CTk):
         self.only_keys = ctk.BooleanVar(value=False)
 
         self._build_ui()
+
+    # ------------------------------------------------------------------
+    def _set_window_icon(self) -> None:
+        """Иконка окна и панели задач: золотой ключ-камень на тёмной плитке."""
+        base = Path(__file__).resolve().parent
+        if sys.platform == "win32":
+            # без собственного AppUserModelID Windows показывает в панели задач
+            # иконку python.exe, а не нашу
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                    "faitingator.wowdamage")
+            except Exception:
+                pass
+        ico = base / "icon.ico"
+        png = base / "icon.png"
+        try:
+            if ico.exists():
+                self.iconbitmap(default=str(ico))
+        except Exception:
+            pass
+        try:
+            if png.exists():
+                self._icon_photo = tk.PhotoImage(file=str(png))
+                self.iconphoto(True, self._icon_photo)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     def _guess_log_path(self, default_log: str | None) -> str:
@@ -615,6 +645,7 @@ class DamageApp(ctk.CTk):
         tab_group = self.tabs.add("Группа")
         tab_stats = self.tabs.add("Характеристики")
         tab_ab = self.tabs.add("Способности")
+        tab_loot = self.tabs.add("Добыча")
         tab_info = self.tabs.add("Инфо")
 
         # --- группа (таблица с полосой урона) ---
@@ -674,6 +705,31 @@ class DamageApp(ctk.CTk):
         aheads = ("Способность", "Урон", "Доля", "Ударов", "Критов", "Макс. удар")
         awidths = (360, 150, 90, 100, 100, 140)
         self.tree_ab = self._make_tree(tab_ab, acols, aheads, awidths, num_from=1)
+
+        # --- добыча (из SavedVariables аддона) ---
+        loot_head = ctk.CTkFrame(tab_loot, fg_color="transparent")
+        loot_head.pack(fill="x", padx=10, pady=(8, 0))
+        ctk.CTkLabel(loot_head, text="ДОБЫЧА", font=("Segoe UI", 12, "bold"),
+                     text_color=TEXT).pack(side="left")
+        self.loot_summary = ctk.CTkLabel(loot_head, text="", font=("Segoe UI", 10),
+                                         text_color=TEXT_DIM)
+        self.loot_summary.pack(side="left", padx=12)
+        self.loot_note = ctk.CTkLabel(tab_loot, text="", text_color=WARN,
+                                      font=("Segoe UI", 10), justify="left",
+                                      anchor="w")
+        self.loot_note.pack(side="bottom", fill="x", padx=12, pady=6)
+        lcols = [
+            {"key": "player", "title": "Игрок", "width": 190, "anchor": "w",
+             "font": "body_bold"},
+            {"key": "item", "title": "Предмет", "width": 420, "anchor": "w",
+             "stretch": True},
+            {"key": "ilvl", "title": "iLvl", "width": 70, "anchor": "center",
+             "font": "num"},
+            {"key": "quality", "title": "Качество", "width": 110, "anchor": "center"},
+            {"key": "time", "title": "Время", "width": 80, "anchor": "center",
+             "font": "num"},
+        ]
+        self.loot_table = BarTable(tab_loot, lcols, fonts=self.fonts)
 
         # --- инфо ---
         addon_row = ctk.CTkFrame(tab_info, fg_color="transparent")
@@ -797,7 +853,9 @@ class DamageApp(ctk.CTk):
             "  игрока), ДПС, доля от общего урона, исцеление, прерывания, смерти.\n"
             "• Характеристики: уровень предметов, сила, ловкость, выносливость,\n"
             "  интеллект, броня, крит, скорость, искусность, универсальность.\n"
-            "• Способности: разбивка урона выбранного игрока по способностям.\n\n"
+            "• Способности: разбивка урона выбранного игрока по способностям.\n"
+            "• Добыча: кому что выпало с финального сундука (предмет, его\n"
+            "  уровень и качество).\n\n"
             "Как считаются цифры\n"
             "===================\n"
             "• Урон считается только по противникам — «Пошатывание» хмелевара и\n"
@@ -817,7 +875,16 @@ class DamageApp(ctk.CTk):
             "================\n"
             "Бонус считается по таймеру подземелья: уложился в 100% времени — +1,\n"
             "в 80% — +2, в 60% — +3. Таймеры стандартных подземелий BfA уже вбиты;\n"
-            "если подземелье неизвестно, бонус показывается как «—»."
+            "если подземелье неизвестно, бонус показывается как «—».\n\n"
+            "Про добычу\n"
+            "==========\n"
+            "Добыча не попадает в боевой журнал, поэтому её записывает аддон\n"
+            "AutoCombatLog: он слушает сообщения чата о полученных предметах и\n"
+            "складывает их в SavedVariables. Приложению нужен файл\n"
+            "      <папка игры>\\WTF\\Account\\<аккаунт>\\SavedVariables\\AutoCombatLog.lua\n"
+            "Игра обновляет его при /reload или выходе из игры — после этого\n"
+            "нажми «Загрузить» (F5). Записи привязываются к заходу по времени\n"
+            "и названию подземелья."
         )
 
     def _show_help(self) -> None:
@@ -847,14 +914,32 @@ class DamageApp(ctk.CTk):
                 return root / "Interface" / "AddOns"
         return None
 
+    def _addon_outdated(self, target: Path) -> bool:
+        """В игре лежит старая копия аддона (файлы отличаются от исходных)."""
+        dest = target / ADDON_SRC.name
+        try:
+            for src in sorted(ADDON_SRC.iterdir()):
+                if not src.is_file():
+                    continue
+                other = dest / src.name
+                if not other.exists() or other.read_bytes() != src.read_bytes():
+                    return True
+        except OSError:
+            return False
+        return False
+
     def _update_addon_status(self, note: str = "") -> None:
         target = self._game_addons_dir()
         if target is None:
             text = "автозапись журнала: путь к игре не распознан"
             color = TEXT_MUTED
         elif (target / ADDON_SRC.name / "AutoCombatLog.toc").exists():
-            text = "автозапись журнала: аддон установлен"
-            color = OK
+            if self._addon_outdated(target):
+                text = "автозапись журнала: аддон устарел — переустанови кнопкой ниже"
+                color = WARN
+            else:
+                text = "автозапись журнала: аддон установлен"
+                color = OK
         else:
             text = "автозапись журнала: аддон не установлен"
             color = WARN
@@ -917,6 +1002,12 @@ class DamageApp(ctk.CTk):
             parser = CombatLogParser(
                 progress_cb=lambda v: self.after(0, lambda: self.progress.set(v)))
             res = parser.parse(path)
+            # добыча лежит не в боевом журнале, а в SavedVariables аддона
+            try:
+                res.loot = load_loot(path)
+                attach_loot(res.runs, res.loot)
+            except Exception:
+                res.loot = []
             self.after(0, lambda: self._parse_done(res))
         except Exception:
             err = traceback.format_exc()
@@ -1018,7 +1109,10 @@ class DamageApp(ctk.CTk):
             for item in tree.get_children():
                 tree.delete(item)
         self.group_table.clear()
+        self.loot_table.clear()
         self.group_summary.configure(text="")
+        self.loot_summary.configure(text="")
+        self.loot_note.configure(text="")
         self.ability_player.configure(values=["—"])
         self.ability_player.set("—")
 
@@ -1090,6 +1184,40 @@ class DamageApp(ctk.CTk):
             self.ability_player.set("—")
             for item in self.tree_ab.get_children():
                 self.tree_ab.delete(item)
+
+        # --- добыча ---
+        self._fill_loot(run, players)
+
+    # ------------------------------------------------------------------
+    def _fill_loot(self, run: Run, players) -> None:
+        """Кому что выпало с финального сундука (данные аддона AutoCombatLog)."""
+        items = list(run.loot)
+        classes = {(p.name or p.guid): p.cls for p in players}
+        rows = []
+        for it in items:
+            cls = classes.get(it.player)
+            rows.append({
+                "player": {"text": it.player or "—",
+                           "color": CLASS_COLORS.get(cls) or TEXT_DIM,
+                           "font": "body_bold"},
+                "item": {"text": it.name or f"предмет #{it.item_id}",
+                         "color": it.color, "font": "body_bold"},
+                "ilvl": {"text": str(it.ilvl) if it.ilvl else "—"},
+                "quality": {"text": it.quality_name, "color": it.color},
+                "time": {"text": it.time.strftime("%H:%M") if it.time else "—"},
+            })
+        self.loot_table.set_rows(rows)
+        self.loot_summary.configure(
+            text=f"{len(items)} предмет(ов)" if items else "")
+        known = bool(getattr(self.result, "loot", None))
+        if items or known:
+            self.loot_note.configure(text="")
+        else:
+            self.loot_note.configure(
+                text="Добыча не попадает в боевой журнал — её записывает аддон "
+                     "AutoCombatLog. Нажмите «Установить автозапись журнала» на "
+                     "вкладке «Инфо», перезапустите игру: записи появятся после "
+                     "/reload или выхода из игры.")
 
     def _class_tag(self, cls: str) -> str:
         tag = f"cls_{cls}" if cls else "cls_none"
@@ -1238,6 +1366,21 @@ class DamageApp(ctk.CTk):
                         round(100.0 * a.damage / total, 1), a.hits, a.crits, a.max_hit,
                     ])
         style_header(ws4, (16, 30, 8, 18, 34, 14, 10, 10, 10, 13))
+
+        ws5 = wb.create_sheet("Добыча")
+        ws5.append(["Дата", "Подземелье", "Ключ", "Игрок", "Предмет", "iLvl",
+                    "Качество", "Время"])
+        for r in self.runs:
+            for it in r.loot:
+                ws5.append([
+                    r.start.strftime("%d.%m.%Y %H:%M") if r.start else "", r.zone,
+                    r.key_level or "", it.player, it.name, it.ilvl or "",
+                    it.quality_name,
+                    it.time.strftime("%H:%M") if it.time else "",
+                ])
+                ws5.cell(row=ws5.max_row, column=5).font = Font(
+                    color=it.color.lstrip("#").upper())
+        style_header(ws5, (16, 30, 8, 18, 38, 8, 14, 8))
 
         wb.save(path)
         self.status.configure(text=f"Сохранено: {path}", text_color=TEXT_DIM)

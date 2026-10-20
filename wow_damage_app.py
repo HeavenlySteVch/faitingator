@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from classes import SPECS, class_by_spec, dungeon_timer, guess_class, refine_spec
+from savedvars import parse_saved_variables, saved_variables_file
 
 # ----------------------------------------------------------------------------
 # Константы
@@ -139,6 +140,7 @@ class Run:
     group_size: int = 0
     boss_kills: int = 0
     players: dict = field(default_factory=dict)
+    loot: list = field(default_factory=list)
 
     @property
     def duration(self) -> timedelta:
@@ -218,6 +220,115 @@ class ParseResult:
     lines_total: int = 0
     player_guid: str = ""
     player_name: str = ""
+    loot: list = field(default_factory=list)         # добыча из аддона (LootItem)
+
+
+# Цвета и названия качества предметов (как в игре).
+QUALITY_COLORS = {
+    0: "#9d9d9d", 1: "#ffffff", 2: "#1eff00", 3: "#0070dd",
+    4: "#a335ee", 5: "#ff8000", 6: "#e6cc80", 7: "#00ccff",
+}
+QUALITY_NAMES = {
+    0: "серое", 1: "обычное", 2: "необычное", 3: "редкое",
+    4: "эпическое", 5: "легендарное", 6: "артефакт", 7: "фамильное",
+}
+
+
+@dataclass
+class LootItem:
+    """Одна запись о добыче из SavedVariables аддона AutoCombatLog."""
+    time: datetime | None = None
+    player: str = ""
+    item_id: int = 0
+    name: str = ""
+    quality: int = 1
+    ilvl: int = 0
+    zone: str = ""
+    instance_id: int = 0
+
+    @property
+    def color(self) -> str:
+        return QUALITY_COLORS.get(self.quality, QUALITY_COLORS[1])
+
+    @property
+    def quality_name(self) -> str:
+        return QUALITY_NAMES.get(self.quality, "")
+
+
+def load_loot(log_path: str | Path) -> list[LootItem]:
+    """Добыча, которую аддон записал в SavedVariables (пусто, если файла нет)."""
+    path = saved_variables_file(log_path)
+    if path is None:
+        return []
+    try:
+        data = parse_saved_variables(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return []
+    db = data.get("AutoCombatLogDB") or {}
+    raw = db.get("loot") or {}
+    if not isinstance(raw, dict):
+        return []
+    items: list[LootItem] = []
+    for entry in raw.values():
+        if not isinstance(entry, dict):
+            continue
+        stamp = entry.get("t")
+        try:
+            when = datetime.fromtimestamp(float(stamp)) if stamp else None
+        except (TypeError, ValueError, OSError, OverflowError):
+            when = None
+        items.append(LootItem(
+            time=when,
+            player=str(entry.get("p") or ""),
+            item_id=int(entry.get("id") or 0),
+            name=str(entry.get("n") or ""),
+            quality=int(entry.get("q") or 1),
+            ilvl=int(entry.get("ilvl") or 0),
+            zone=str(entry.get("z") or ""),
+            instance_id=int(entry.get("i") or 0),
+        ))
+    items.sort(key=lambda x: x.time or datetime.min)
+    return items
+
+
+def _norm_zone(value: str) -> str:
+    return (value or "").strip().lower().replace("ё", "е")
+
+
+def attach_loot(runs: list, loot: list[LootItem],
+                before: timedelta = timedelta(minutes=10),
+                after: timedelta = timedelta(minutes=30)) -> int:
+    """Раскладывает добычу по заходам: по времени и названию подземелья.
+
+    Ключ заканчивается на CHALLENGE_MODE_END, а лут падает уже после него,
+    поэтому окно после финиша шире (30 минут). Возвращает число совпадений.
+    """
+    attached = 0
+    for item in loot:
+        if item.time is None:
+            continue
+        best = None
+        best_delta = None
+        for run in runs:
+            if not run.is_instance:
+                continue
+            start = run.key_start or run.start
+            end = run.end or start
+            if start is None:
+                continue
+            if item.time < start - before or item.time > end + after:
+                continue
+            if item.zone and run.zone and _norm_zone(item.zone) != _norm_zone(run.zone):
+                continue
+            delta = abs((item.time - end).total_seconds())
+            if best is None or delta < best_delta:
+                best, best_delta = run, delta
+        if best is not None:
+            best.loot.append(item)
+            attached += 1
+    for run in runs:
+        run.loot.sort(key=lambda x: x.time or datetime.min)
+    return attached
 
 
 # ----------------------------------------------------------------------------
