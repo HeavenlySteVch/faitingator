@@ -270,3 +270,40 @@ def dungeon_timer(zone: str, challenge_mode_id: int = 0) -> int | None:
         if name in low:
             return seconds
     return None
+
+
+# Ступени цвета рейтинга Mythic+ (как в Raider.IO): порог → цвет.
+# Пороги под масштаб Firestorm: счёт = сумма лучших результатов по данжам,
+# один данж даёт ~230–380, полный набор из 12 — 3000–4500.
+RIO_COLORS: list[tuple[int, str]] = [
+    (0, "#9d9d9d"),      # серый
+    (500, "#ffffff"),    # белый
+    (1000, "#1eff00"),   # зелёный
+    (2000, "#0070dd"),   # синий
+    (3000, "#a335ee"),   # фиолетовый
+    (4000, "#ff8000"),   # оранжевый
+    (5000, "#e6cc80"),   # золотой
+]
+
+
+def rio_color(score: float | None) -> str:
+    """Цвет цифры рейтинга по его величине."""
+    if score is None:
+        return "#6b7280"
+    color = RIO_COLORS[0][1]
+    for threshold, value in RIO_COLORS:
+        if score >= threshold:
+            color = value
+    return color
+
+
+def rio_tier(score: float | None) -> str:
+    """Подпись ступени рейтинга (для подсказки)."""
+    if score is None:
+        return "нет данных"
+    names = ["серая", "белая", "зелёная", "синяя", "фиолетовая", "оранжевая", "золотая"]
+    index = 0
+    for i, (threshold, _color) in enumerate(RIO_COLORS):
+        if score >= threshold:
+            index = i
+    return names[index]

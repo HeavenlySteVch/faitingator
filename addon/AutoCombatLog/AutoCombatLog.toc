@@ -1,8 +1,8 @@
 ## Interface: 80300
 ## Title: AutoCombatLog
-## Notes: Автоматически включает запись боевого журнала (вместо /combatlog) и запоминает добычу
-## Notes-enUS: Automatically enables combat logging on login (no /combatlog needed) and records loot
-## Version: 1.1
+## Notes: Автоматически включает запись боевого журнала (вместо /combatlog), запоминает добычу и рейтинг Mythic+
+## Notes-enUS: Automatically enables combat logging on login (no /combatlog needed), records loot and Mythic+ score
+## Version: 1.2
 ## Author: faitingator
 ## X-Category: Data Export
 ## SavedVariables: AutoCombatLogDB

@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-__all__ = ["parse_saved_variables", "saved_variables_file"]
+__all__ = ["parse_saved_variables", "saved_variables_file", "load_addon_db", "load_score"]
 
 _TOKEN_RE = re.compile(
     r"""
@@ -157,3 +157,34 @@ def saved_variables_file(log_path: str | Path, addon: str = "AutoCombatLog") -> 
     if not found:
         return None
     return max(found, key=lambda p: p.stat().st_mtime)
+
+
+def load_addon_db(log_path: str | Path, addon: str = "AutoCombatLog") -> dict[str, Any]:
+    """Таблица <аддон>DB из SavedVariables (пустая, если файла нет)."""
+    path = saved_variables_file(log_path, addon)
+    if path is None:
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        data = parse_saved_variables(text)
+    except (OSError, ValueError):
+        return {}
+    db = data.get(f"{addon}DB")
+    return db if isinstance(db, dict) else {}
+
+
+def load_score(log_path: str | Path) -> dict[str, Any]:
+    """Рейтинг Mythic+ (Fio), который аддон сохранил из игры.
+
+    Возвращает {'value': float, 'source': str, 't': int} или пустой словарь.
+    """
+    db = load_addon_db(log_path)
+    value = db.get("score")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return {}
+    return {
+        "value": float(value),
+        "source": str(db.get("score_source") or "игра"),
+        "season": int(db.get("score_season") or 0),
+        "t": int(db.get("score_t") or 0),
+    }

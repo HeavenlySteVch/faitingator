@@ -17,9 +17,10 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 import customtkinter as ctk
 
-from classes import CLASS_COLORS
+from classes import CLASS_COLORS, rio_color
 from wow_damage_app import (CombatLogParser, DEFAULT_LOG_PATHS, ParseResult, Run,
                             attach_loot, load_loot)
+from savedvars import load_score
 
 
 # ----------------------------------------------------------------------------
@@ -475,6 +476,8 @@ class DamageApp(ctk.CTk):
         self.only_keys = ctk.BooleanVar(value=False)
 
         self._build_ui()
+        self._refresh_rio()
+        self.after(60_000, self._tick_rio)
 
     # ------------------------------------------------------------------
     def _set_window_icon(self) -> None:
@@ -534,6 +537,15 @@ class DamageApp(ctk.CTk):
                      text_color=TEXT).pack(anchor="w")
         ctk.CTkLabel(left, text="статистика заходов в подземелья по боевому журналу",
                      font=("Segoe UI", 10), text_color=TEXT_MUTED).pack(anchor="w")
+        # ---- рейтинг Mythic+ (на Firestorm он называется Fio) ----
+        self.rio_card = ctk.CTkFrame(header, fg_color="transparent")
+        self.rio_card.pack(side="right", padx=(10, 18), pady=6)
+        ctk.CTkLabel(self.rio_card, text="RIO", font=("Segoe UI", 9, "bold"),
+                     text_color=TEXT_MUTED).pack(anchor="e")
+        self.rio_value = ctk.CTkLabel(self.rio_card, text="—",
+                                      font=("Segoe UI", 21, "bold"),
+                                      text_color=TEXT_MUTED)
+        self.rio_value.pack(anchor="e")
         # индикаторы формата лога
         self.badges = ctk.CTkFrame(header, fg_color="transparent")
         self.badges.pack(side="right", padx=16)
@@ -783,6 +795,35 @@ class DamageApp(ctk.CTk):
             self.after(400, self._start_parse)
 
     # ------------------------------------------------------------------
+    def _refresh_rio(self) -> None:
+        """Рейтинг Mythic+ из SavedVariables аддона (обновляется при загрузке лога)."""
+        path = self.log_path.get().strip()
+        info: dict = {}
+        if path:
+            try:
+                info = load_score(path)
+            except Exception:
+                info = {}
+        self._set_rio(info)
+
+    def _set_rio(self, info: dict) -> None:
+        value = info.get("value")
+        if value is None:
+            self.rio_value.configure(text="—", text_color=TEXT_MUTED)
+            return
+        try:
+            text = fmt_int(int(round(float(value))))
+        except (TypeError, ValueError):
+            text = str(value)
+        self.rio_value.configure(text=text, text_color=rio_color(value))
+
+    def _tick_rio(self) -> None:
+        """Раз в минуту перечитывает рейтинг: игра обновляет его при /reload."""
+        try:
+            self._refresh_rio()
+        finally:
+            self.after(60_000, self._tick_rio)
+
     def _badge(self, parent, text: str) -> ctk.CTkLabel:
         """Небольшой индикатор-«пилюля» в шапке."""
         label = ctk.CTkLabel(parent, text=text, font=("Segoe UI", 10),
@@ -1054,6 +1095,7 @@ class DamageApp(ctk.CTk):
                      "/console advancedCombatLogging 1 и пройди заход заново.")
 
         self._refresh_runs()
+        self._refresh_rio()
 
     # ------------------------------------------------------------------
     def _refresh_runs(self) -> None:
