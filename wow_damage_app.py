@@ -59,6 +59,13 @@ FLAG_PET = 0x1000 | 0x2000
 # Ауры, по которым восстанавливается связь «питомец -> владелец».
 AURA_EVENTS = ("SPELL_AURA_APPLIED", "SPELL_AURA_REFRESH", "SPELL_AURA_APPLIED_DOSE")
 
+# Полная группа подземелья. Заходы, где народу было меньше (зашёл один,
+# посмотреть/починиться и вышел), в историю не попадают.
+MIN_GROUP_SIZE = 5
+# Если игрок вышел из инстанса и вернулся в него в пределах этого времени,
+# это тот же заход: урон и время склеиваются, а пауза в зачёт не идёт.
+MERGE_GAP = timedelta(minutes=15)
+
 
 # ----------------------------------------------------------------------------
 # Модель данных
@@ -141,13 +148,17 @@ class Run:
     boss_kills: int = 0
     players: dict = field(default_factory=dict)
     loot: list = field(default_factory=list)
+    # секунды, проведённые вне инстанса между кусками одного захода
+    # (выходил починиться/дождаться группу и вернулся) — не идут во время
+    pause_seconds: float = 0.0
 
     @property
     def duration(self) -> timedelta:
         if self.key_time_ms:
             return timedelta(milliseconds=self.key_time_ms)
         if self.start and self.end:
-            return timedelta(seconds=round((self.end - self.start).total_seconds()))
+            seconds = (self.end - self.start).total_seconds() - self.pause_seconds
+            return timedelta(seconds=round(max(0.0, seconds)))
         return timedelta(0)
 
     @property
@@ -429,6 +440,72 @@ def gear_ilvls(field_value: str) -> list[int]:
 # ----------------------------------------------------------------------------
 # Парсер
 # ----------------------------------------------------------------------------
+def _absorb_run(target: Run, extra: Run) -> None:
+    """Приписывает к заходу ещё один кусок того же прохождения."""
+    active = target.duration.total_seconds() + extra.duration.total_seconds()
+    if extra.start and (target.start is None or extra.start < target.start):
+        target.start = extra.start
+    if extra.end and (target.end is None or extra.end > target.end):
+        target.end = extra.end
+    if target.start and target.end:
+        wall = (target.end - target.start).total_seconds()
+        target.pause_seconds = max(0.0, wall - active)
+    target.boss_kills += extra.boss_kills
+    target.group_size = max(target.group_size, extra.group_size)
+    target.loot.extend(extra.loot)
+    for guid, p in extra.players.items():
+        cur = target.players.get(guid)
+        if cur is None:
+            target.players[guid] = p
+            continue
+        cur.damage += p.damage
+        cur.healing += p.healing
+        cur.interrupts += p.interrupts
+        cur.deaths += p.deaths
+        cur.active |= p.active
+        for spell_id, count in p.spell_ids.items():
+            cur.spell_ids[spell_id] = cur.spell_ids.get(spell_id, 0) + count
+        for name, st in p.abilities.items():
+            tgt = cur.abilities.get(name)
+            if tgt is None:
+                cur.abilities[name] = st
+            else:
+                tgt.damage += st.damage
+                tgt.hits += st.hits
+                tgt.crits += st.crits
+                tgt.max_hit = max(tgt.max_hit, st.max_hit)
+        if p.info is not None:
+            cur.info = p.info
+        if not cur.name:
+            cur.name = p.name
+
+
+def merge_run_fragments(runs: list[Run], gap: timedelta = MERGE_GAP) -> list[Run]:
+    """Склеивает куски одного захода, если игрок выходил из инстанса и вернулся.
+
+    Клиент закрывает заход при выходе из подземелья, поэтому «вышел починиться
+    или дождаться группу и вернулся» превращается в несколько строк с обрывками
+    урона. Куски одного instanceID, между которыми прошло меньше ``gap``,
+    считаются одним заходом: урон и убийства суммируются, а время — только
+    проведённое внутри инстанса.
+    """
+    merged: list[Run] = []
+    last: dict[int, Run] = {}
+    for run in sorted(runs, key=lambda r: r.start or datetime.min):
+        prev = last.get(run.instance_id) if run.instance_id else None
+        if (prev is not None
+                and prev.is_instance and run.is_instance
+                and prev.key_level is None and run.key_level is None
+                and prev.end and run.start
+                and timedelta(0) <= run.start - prev.end <= gap):
+            _absorb_run(prev, run)
+            continue
+        merged.append(run)
+        if run.instance_id:
+            last[run.instance_id] = run
+    return merged
+
+
 class CombatLogParser:
     def __init__(self, progress_cb=None):
         self.progress_cb = progress_cb
@@ -756,6 +833,7 @@ class CombatLogParser:
                 credit(run_obj, owner, "", amount, event, a, adv, amount_idx, ts)
 
         # ---------- финализация ----------
+        runs = merge_run_fragments(runs)
         res.players.update(names)
         for guid in res.combatants:
             res.players.setdefault(guid, "")
@@ -787,7 +865,9 @@ class CombatLogParser:
                                   or pl.deaths or pl.info is not None)]:
                 del run.players[stray]
 
-        res.runs = [r for r in runs if r.players and not r.is_empty]
+        res.runs = [r for r in runs
+                    if r.players and not r.is_empty
+                    and (not r.is_instance or len(r.players) >= MIN_GROUP_SIZE)]
 
         totals: dict[str, int] = defaultdict(int)
         for run in res.runs:
