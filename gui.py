@@ -410,14 +410,18 @@ class BarTable:
                                              fill=mix(dark, light, t0),
                                              width=0, tags="bar")
         if text:
-            tx = x + w - self.PAD
+            num_font = self.fonts["num_bold"]
+            tx = x + w - self.PAD - 4
             ty = y + self.ROW_H / 2
-            # тень-обводка: число читается и на тёмном фоне, и на светлой полосе
+            # Число, которое целиком лежит на полосе, пишем контрастным цветом,
+            # а если оно вылезает за полосу — светлым: иначе тёмные цифры
+            # теряются на тёмном фоне дорожки. Тень-обводка помогает на границе.
+            over_bar = tx <= cursor - 2 and tx - num_font.measure(text) >= x0
+            fill = contrast_text(color) if over_bar else TEXT
             self.canvas.create_text(tx + 1, ty + 1, text=text, anchor="e",
-                                    fill="#000000", font=self.fonts["num_bold"])
+                                    fill="#000000", font=num_font)
             self.canvas.create_text(tx, ty, text=text, anchor="e",
-                                    fill=contrast_text(color),
-                                    font=self.fonts["num_bold"])
+                                    fill=fill, font=num_font)
 
     def _draw_parts(self, parts: list, x: int, w: int, y: int, font_name=None) -> None:
         """Несколько цветных фрагментов в одной ячейке (например, имена игроков)."""

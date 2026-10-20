@@ -560,6 +560,19 @@ class CombatLogParser:
                     if (cur is not None and cur.zone == zone
                             and cur.instance_id == instance and cur.difficulty == difficulty):
                         continue
+                    # Смена подзоны внутри того же инстанса — это тот же заход.
+                    # Например, в «Осаде Боралуса» клиент шлёт ZONE_CHANGE на
+                    # «Осада боралусского моста» и обратно: раньше из-за этого
+                    # один ключ распадался на несколько строк (каждая со своим
+                    # куском урона). В открытом мире у разных локаций тоже
+                    # бывает один mapID (Зулдазар и Дазар'алор — 1642), но там
+                    # сложность 0, поэтому по-прежнему делим.
+                    if (cur is not None and instance and cur.instance_id == instance
+                            and (difficulty > 0 or cur.difficulty > 0)):
+                        if (dungeon_timer(cur.zone) is None
+                                and dungeon_timer(zone) is not None):
+                            cur.zone = zone        # подзона -> настоящее имя
+                        continue
                     close_current(ts)
                     cur_zone = zone
                     cur = Run(zone=zone, instance_id=instance, difficulty=difficulty, start=ts)
@@ -570,17 +583,28 @@ class CombatLogParser:
                     instance = to_int(a[1]) if len(a) > 1 else 0
                     cm_id = to_int(a[2]) if len(a) > 2 else 0
                     level = to_int(a[3]) if len(a) > 3 else 0
-                    if cur is None or cur.zone != zone:
+                    # тот же инстанс, но другая подзона — это продолжение захода
+                    same_instance = bool(instance) and cur is not None \
+                        and cur.instance_id == instance
+                    if cur is None or (cur.zone != zone and not same_instance):
                         close_current(ts)
                         cur = Run(zone=zone, instance_id=instance, start=ts)
-                    cur.key_level = level or None
+                    elif dungeon_timer(cur.zone) is None:
+                        cur.zone = zone            # имя из старта ключа точнее
+                    prev_level = cur.key_level
+                    cur.key_level = level or prev_level
                     cur.instance_id = instance or cur.instance_id
                     cur.cm_id = cm_id or cur.cm_id
                     cur.timer_limit = dungeon_timer(cur.zone, cur.cm_id)
                     # Ключ начался: игра и Details считают урон/исцеление/смерти
                     # именно с этого момента. Всё, что набралось с момента входа
                     # в данж (мусор до вставки ключа), отбрасываем.
-                    if level:
+                    # Повторный START того же ключа (Firestorm иногда присылает
+                    # его дважды с разницей в секунды) заново не обнуляет счёт.
+                    repeat = (level and cur.key_start is not None
+                              and (ts - cur.key_start).total_seconds() < 60
+                              and level == (prev_level or 0))
+                    if level and not repeat:
                         cur.key_start = ts
                         for p in cur.players.values():
                             p.damage = 0
