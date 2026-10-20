@@ -11,7 +11,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-__all__ = ["parse_saved_variables", "saved_variables_file", "load_addon_db", "load_score"]
+__all__ = ["parse_saved_variables", "saved_variables_file", "load_addon_db",
+           "load_score", "load_characters", "account_characters"]
 
 _TOKEN_RE = re.compile(
     r"""
@@ -187,4 +188,49 @@ def load_score(log_path: str | Path) -> dict[str, Any]:
         "source": str(db.get("score_source") or "игра"),
         "season": int(db.get("score_season") or 0),
         "t": int(db.get("score_t") or 0),
+    }
+
+
+def account_characters(log_path: str | Path,
+                       addon: str = "AutoCombatLog") -> list[str]:
+    """Имена персонажей аккаунта по папкам WTF.
+
+    Клиент создаёт `WTF\\Account\\<аккаунт>\\<сервер>\\<персонаж>\\` при первом
+    входе за героя, поэтому там лежат все твои персонажи — даже те, кем давно
+    не играл и кого нет в боевом журнале.
+    """
+    path = saved_variables_file(log_path, addon)
+    if path is None:
+        return []
+    account = path.parent.parent
+    names: set[str] = set()
+    try:
+        realms = [p for p in account.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+    for realm in realms:
+        if realm.name.lower() == "savedvariables":
+            continue
+        try:
+            names.update(c.name for c in realm.iterdir() if c.is_dir())
+        except OSError:
+            continue
+    return sorted(names)
+
+
+def load_characters(log_path: str | Path) -> dict[str, Any]:
+    """Персонажи аккаунта: папки WTF + имена, которые запомнил аддон.
+
+    Возвращает {'names': [...], 'current': '...'}.
+    """
+    db = load_addon_db(log_path)
+    chars = db.get("chars")
+    names: set[str] = set()
+    if isinstance(chars, dict):
+        names.update(name for name in chars if isinstance(name, str))
+    names.update(account_characters(log_path))
+    current = db.get("current")
+    return {
+        "names": sorted(names),
+        "current": current if isinstance(current, str) else "",
     }

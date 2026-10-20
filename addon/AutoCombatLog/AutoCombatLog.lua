@@ -14,6 +14,7 @@
 --   /acl off   — выключить автозапись
 --   /acl now   — включить запись прямо сейчас
 --   /acl loot  — сколько записей о добыче собрано
+--   /acl chars — список твоих персонажей (аддон запоминает каждого, кем заходил)
 
 local ADDON = "AutoCombatLog"
 
@@ -355,6 +356,32 @@ local function probeScore()
 end
 
 -- ---------------------------------------------------------------------------
+-- Персонажи аккаунта: аддон записывает имя каждый раз, когда им заходят,
+-- чтобы приложение знало все твои альты и подсвечивало их в заходах
+-- ---------------------------------------------------------------------------
+local function rememberCharacter()
+    if not db then return end
+    local name = UnitName("player")
+    if not name then return end
+    db.chars = db.chars or {}
+    db.chars[name] = {
+        realm = GetRealmName() or "",
+        guid = UnitGUID("player") or "",
+        seen = time(),
+    }
+    db.current = name
+end
+
+-- Сколько персонажей аккаунта уже запомнили
+local function countChars()
+    local n = 0
+    for _ in pairs((db and db.chars) or {}) do
+        n = n + 1
+    end
+    return n
+end
+
+-- ---------------------------------------------------------------------------
 -- Рейтинг Mythic+ (Fio): серверная панель MythicScore держит его в
 -- MythicScore.data.overall — оттуда и берём цифру для приложения
 -- ---------------------------------------------------------------------------
@@ -401,6 +428,7 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, _, arg4)
         -- раз в минуту подхватываем рейтинг, когда панель MythicScore его получит
         if C_Timer and C_Timer.NewTicker then C_Timer.NewTicker(60, readMythicScore) end
     elseif event == "PLAYER_LOGIN" then
+        rememberCharacter()
         check("login", true)
     elseif event == "PLAYER_ENTERING_WORLD" then
         check("world", false)
@@ -432,7 +460,8 @@ local function status()
     msg(text .. "; расширенное логирование: " .. (adv and "вкл" or "выкл")
         .. "; автозапись: " .. (db.enabled and "вкл" or "выкл")
         .. "; добыча: " .. #(db.loot or {}) .. " записей"
-        .. "; рейтинг: " .. (db.score and string.format("%.1f", db.score) or "—"))
+        .. "; рейтинг: " .. (db.score and string.format("%.1f", db.score) or "—")
+        .. "; персонажи: " .. countChars())
 end
 
 SLASH_AUTOCOMBATLOG1 = "/acl"
@@ -466,6 +495,15 @@ SlashCmdList["AUTOCOMBATLOG"] = function(input)
         msg("рейтинг Mythic+ (Fio): "
             .. (db.score and string.format("%.1f", db.score) or "не найден")
             .. (db.score_season and (" (сезон " .. tostring(db.score_season) .. ")") or ""))
+    elseif input == "chars" then
+        local names = {}
+        for name in pairs(db.chars or {}) do
+            names[#names + 1] = name
+        end
+        table.sort(names)
+        msg("персонажи (" .. #names .. "): "
+            .. (#names > 0 and table.concat(names, ", ")
+                or "пока нет — зайди в игру и сделай /reload"))
     else
         status()
     end

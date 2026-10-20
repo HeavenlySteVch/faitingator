@@ -20,7 +20,7 @@ import customtkinter as ctk
 from classes import CLASS_COLORS, rio_color, role_rank
 from wow_damage_app import (CombatLogParser, DEFAULT_LOG_PATHS, ParseResult, Run,
                             attach_loot, load_loot)
-from savedvars import load_score
+from savedvars import load_characters, load_score
 
 
 # ----------------------------------------------------------------------------
@@ -44,6 +44,7 @@ CARD_2_HOVER = "#323a46"
 WARN = "#e0a33a"
 OK = "#7ec27e"
 LEADER = "#ffd479"
+MINE = "#7ee0ff"
 
 FONT = "Segoe UI"
 FONT_NUM = "Consolas"
@@ -426,7 +427,7 @@ class BarTable:
 
     def _draw_parts(self, parts: list, x: int, w: int, y: int, font_name=None) -> None:
         """Несколько цветных фрагментов в одной ячейке (например, имена игроков)."""
-        font = self.fonts.get(font_name or "body", self.fonts["body"])
+        default = self.fonts.get(font_name or "body", self.fonts["body"])
         cx = x + self.PAD
         limit = x + w - self.PAD
         ellipsis = "…"
@@ -434,6 +435,7 @@ class BarTable:
             text = str(part.get("text", ""))
             if not text:
                 continue
+            font = self.fonts.get(part.get("font") or font_name or "body", default)
             color = part.get("color") or TEXT
             if cx + font.measure(text) > limit:
                 while text and cx + font.measure(text + ellipsis) > limit:
@@ -474,9 +476,12 @@ class DamageApp(ctk.CTk):
         self.search = ctk.StringVar()
         self.only_instances = ctk.BooleanVar(value=True)
         self.only_keys = ctk.BooleanVar(value=False)
+        self.char_filter = ctk.StringVar(value="Все")
+        self.mine_names: set[str] = set()
 
         self._build_ui()
         self._refresh_rio()
+        self._refresh_mine()
         self.after(60_000, self._tick_rio)
 
     # ------------------------------------------------------------------
@@ -581,13 +586,23 @@ class DamageApp(ctk.CTk):
                         checkbox_width=20, checkbox_height=20, corner_radius=5)
         ctk.CTkCheckBox(filt, text="Только подземелья", variable=self.only_instances,
                         command=self._refresh_runs, **check_kw).pack(
-            side="left", padx=(14, 16), pady=10)
+            side="left", padx=(14, 12), pady=10)
         ctk.CTkCheckBox(filt, text="Только ключи", variable=self.only_keys,
                         command=self._refresh_runs, **check_kw).pack(
-            side="left", padx=(0, 20), pady=10)
+            side="left", padx=(0, 14), pady=10)
+        ctk.CTkLabel(filt, text="Персонаж", font=("Segoe UI", 11, "bold"),
+                     text_color=TEXT_DIM).pack(side="left", padx=(0, 6))
+        self.char_menu = ctk.CTkOptionMenu(
+            filt, values=["Все"], variable=self.char_filter, width=170, height=30,
+            corner_radius=8, fg_color=CARD_2, button_color=CARD_2,
+            button_hover_color=CARD_2_HOVER, text_color=TEXT,
+            dropdown_fg_color=CARD_2, dropdown_hover_color=CARD_2_HOVER,
+            dropdown_text_color=TEXT, font=("Segoe UI", 11),
+            command=lambda _v: self._refresh_runs())
+        self.char_menu.pack(side="left", padx=(0, 10))
         ctk.CTkLabel(filt, text="Поиск", font=("Segoe UI", 11, "bold"),
                      text_color=TEXT_DIM).pack(side="left", padx=(0, 6))
-        entry = ctk.CTkEntry(filt, textvariable=self.search, width=260, height=30,
+        entry = ctk.CTkEntry(filt, textvariable=self.search, width=190, height=30,
                              corner_radius=8, fg_color=CARD_2, border_color=BORDER,
                              text_color=TEXT, placeholder_text="название подземелья",
                              placeholder_text_color=TEXT_MUTED, font=("Segoe UI", 11))
@@ -619,7 +634,7 @@ class DamageApp(ctk.CTk):
         ctk.CTkLabel(runs_head, text="ЗАХОДЫ", font=("Segoe UI", 12, "bold"),
                      text_color=TEXT).pack(side="left")
         ctk.CTkLabel(runs_head, text="клик по строке — детали группы; строка "
-                                     "окрашена по уровню ключа",
+                                     "окрашена по уровню ключа; ◆ — твой персонаж",
                      font=("Segoe UI", 9), text_color=TEXT_MUTED).pack(
             side="left", padx=10)
         self.runs_count = ctk.CTkLabel(runs_head, text="", font=("Segoe UI", 11),
@@ -795,6 +810,38 @@ class DamageApp(ctk.CTk):
             self.after(400, self._start_parse)
 
     # ------------------------------------------------------------------
+    def _refresh_mine(self) -> None:
+        """Персонажи аккаунта из SavedVariables — для подсветки и фильтра."""
+        path = self.log_path.get().strip()
+        names: list[str] = []
+        if path:
+            try:
+                names = list(load_characters(path).get("names") or [])
+            except Exception:
+                names = []
+        self.mine_names = set(names)
+        values = self._char_values()
+        try:
+            self.char_menu.configure(values=values)
+        except Exception:
+            pass
+        if self.char_filter.get() not in values:
+            self.char_filter.set("Все")
+
+    def _char_values(self) -> list[str]:
+        """Варианты фильтра: «Все» + мои персонажи (пока список пуст — все из лога)."""
+        values = ["Все"]
+        if self.mine_names:
+            values += sorted(self.mine_names)
+        elif self.result is not None:
+            names = set()
+            for run in self.result.runs:
+                for p in run.players.values():
+                    if p.name:
+                        names.add(p.name)
+            values += sorted(names)
+        return values
+
     def _refresh_rio(self) -> None:
         """Рейтинг Mythic+ из SavedVariables аддона (обновляется при загрузке лога)."""
         path = self.log_path.get().strip()
@@ -818,9 +865,10 @@ class DamageApp(ctk.CTk):
         self.rio_value.configure(text=text, text_color=rio_color(value))
 
     def _tick_rio(self) -> None:
-        """Раз в минуту перечитывает рейтинг: игра обновляет его при /reload."""
+        """Раз в минуту перечитывает рейтинг и список персонажей."""
         try:
             self._refresh_rio()
+            self._refresh_mine()
         finally:
             self.after(60_000, self._tick_rio)
 
@@ -1094,6 +1142,7 @@ class DamageApp(ctk.CTk):
                 text="Характеристики недоступны: включи в игре "
                      "/console advancedCombatLogging 1 и пройди заход заново.")
 
+        self._refresh_mine()
         self._refresh_runs()
         self._refresh_rio()
 
@@ -1109,6 +1158,10 @@ class DamageApp(ctk.CTk):
             runs = [r for r in runs if r.is_instance]
         if self.only_keys.get():
             runs = [r for r in runs if r.key_level]
+        who = self.char_filter.get()
+        if who and who != "Все":
+            runs = [r for r in runs
+                    if any((p.name or p.guid) == who for p in r.players.values())]
         if text:
             runs = [r for r in runs if text in r.zone.lower()]
         runs.sort(key=lambda r: r.start.timestamp() if r.start else 0, reverse=True)
@@ -1142,6 +1195,7 @@ class DamageApp(ctk.CTk):
         """Имена участников захода, каждое — цветом класса.
 
         Порядок: танк, лекарь, затем дд (внутри роли — по урону).
+        Свои персонажи помечены ромбом «◆» и жирным шрифтом.
         """
         players = [p for p in run.players.values() if p.damage or p.healing or p.interrupts]
         players.sort(key=lambda p: (role_rank(p.spec_id), -p.damage))
@@ -1149,8 +1203,13 @@ class DamageApp(ctk.CTk):
         for p in players:
             if parts:
                 parts.append({"text": ", ", "color": TEXT_MUTED})
-            parts.append({"text": p.name or p.guid,
-                          "color": CLASS_COLORS.get(p.cls) or "#d0d0d0"})
+            name = p.name or p.guid
+            mine = name in self.mine_names
+            if mine:
+                parts.append({"text": "◆ ", "color": MINE, "font": "body_bold"})
+            parts.append({"text": name,
+                          "color": CLASS_COLORS.get(p.cls) or "#d0d0d0",
+                          "font": "body_bold" if mine else None})
         if not parts:
             return {"text": "—"}
         return {"parts": parts}
@@ -1192,12 +1251,14 @@ class DamageApp(ctk.CTk):
             color = CLASS_COLORS.get(p.cls) or ACCENT
             is_leader = i == 0 and p.damage > 0
             name = p.name or p.guid
+            chunks = []
+            if name in self.mine_names:
+                chunks.append({"text": "◆ ", "color": MINE})
+            if is_leader:
+                chunks.append({"text": "★ ", "color": LEADER})
+            chunks.append({"text": name, "color": color})
             rows.append({
-                "name": ({"parts": [{"text": "★ ", "color": LEADER},
-                                    {"text": name, "color": color}],
-                          "font": "body_bold"}
-                         if is_leader else
-                         {"text": name, "color": color, "font": "body_bold"}),
+                "name": {"parts": chunks, "font": "body_bold"},
                 "ilvl": {"text": f"{p.info.ilvl:.0f}" if (p.info and p.info.ilvl) else "—"},
                 "spec": {"text": p.spec or "—", "color": TEXT_DIM if not p.spec else TEXT},
                 "damage": {"text": fmt_int(p.damage), "bar": p.damage,
@@ -1217,8 +1278,9 @@ class DamageApp(ctk.CTk):
         for i, p in enumerate(players):
             inf = p.info
             has = inf is not None and inf.has_stats
+            pname = p.name or p.guid
             self.tree_stats.insert("", "end", values=(
-                p.name or p.guid,
+                ("◆ " if pname in self.mine_names else "") + pname,
                 p.cls or "—",
                 f"{inf.ilvl:.0f}" if inf and inf.ilvl else "—",
                 fmt_int(inf.strength) if has else "—",
@@ -1254,10 +1316,16 @@ class DamageApp(ctk.CTk):
         rows = []
         for it in items:
             cls = classes.get(it.player)
+            pname = it.player or "—"
+            cls_color = CLASS_COLORS.get(cls) or TEXT_DIM
+            if pname in self.mine_names:
+                player_cell = {"parts": [
+                    {"text": "◆ ", "color": MINE},
+                    {"text": pname, "color": cls_color}], "font": "body_bold"}
+            else:
+                player_cell = {"text": pname, "color": cls_color, "font": "body_bold"}
             rows.append({
-                "player": {"text": it.player or "—",
-                           "color": CLASS_COLORS.get(cls) or TEXT_DIM,
-                           "font": "body_bold"},
+                "player": player_cell,
                 "item": {"text": it.name or f"предмет #{it.item_id}",
                          "color": it.color, "font": "body_bold"},
                 "ilvl": {"text": str(it.ilvl) if it.ilvl else "—"},
