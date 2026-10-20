@@ -184,6 +184,36 @@ def class_by_spec(spec_id: int | None) -> tuple[str, str]:
     return SPECS.get(int(spec_id), ("", ""))
 
 
+# Роли специализаций BfA: танки и лекари, остальные — дд.
+SPEC_ROLES: dict[int, str] = {
+    250: "tank",    # Рыцарь смерти — Кровь
+    581: "tank",    # Охотник на демонов — Месть
+    104: "tank",    # Друид — Страж
+    268: "tank",    # Монах — Хмелевар
+    66: "tank",     # Паладин — Защита
+    73: "tank",     # Воин — Защита
+    105: "healer",  # Друид — Исцеление
+    270: "healer",  # Монах — Ткач туманов
+    65: "healer",   # Паладин — Свет
+    256: "healer",  # Жрец — Послушание
+    257: "healer",  # Жрец — Свет
+    264: "healer",  # Шаман — Исцеление
+}
+
+# Порядок ролей для вывода: сначала танк, потом лекарь, потом дд.
+ROLE_ORDER: dict[str, int] = {"tank": 0, "healer": 1, "dps": 2}
+
+
+def spec_role(spec_id: int | None) -> str:
+    """Роль по специализации: 'tank', 'healer' или 'dps'."""
+    return SPEC_ROLES.get(int(spec_id or 0), "dps")
+
+
+def role_rank(spec_id: int | None) -> int:
+    """Место роли в сортировке (танк → лекарь → дд)."""
+    return ROLE_ORDER[spec_role(spec_id)]
+
+
 def refine_spec(cls: str, spec_id: int, spell_ids: dict[int, int]) -> int:
     """Уточняет специализацию по способностям (в логе может быть лут-спек).
 

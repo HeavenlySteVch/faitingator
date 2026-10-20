@@ -17,7 +17,7 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 import customtkinter as ctk
 
-from classes import CLASS_COLORS, rio_color
+from classes import CLASS_COLORS, rio_color, role_rank
 from wow_damage_app import (CombatLogParser, DEFAULT_LOG_PATHS, ParseResult, Run,
                             attach_loot, load_loot)
 from savedvars import load_score
@@ -1139,9 +1139,12 @@ class DamageApp(ctk.CTk):
             self._clear_details()
 
     def _players_cell(self, run: Run) -> dict:
-        """Имена участников захода, каждое — цветом класса."""
+        """Имена участников захода, каждое — цветом класса.
+
+        Порядок: танк, лекарь, затем дд (внутри роли — по урону).
+        """
         players = [p for p in run.players.values() if p.damage or p.healing or p.interrupts]
-        players.sort(key=lambda p: p.damage, reverse=True)
+        players.sort(key=lambda p: (role_rank(p.spec_id), -p.damage))
         parts = []
         for p in players:
             if parts:
