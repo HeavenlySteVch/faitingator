@@ -718,6 +718,8 @@ class DamageApp(ctk.CTk):
                                       font=("Segoe UI", 10), justify="left",
                                       anchor="w")
         self.loot_note.pack(side="bottom", fill="x", padx=12, pady=6)
+        tab_loot.bind("<Configure>", lambda e: self.loot_note.configure(
+            wraplength=max(320, e.width - 30)))
         lcols = [
             {"key": "player", "title": "Игрок", "width": 190, "anchor": "w",
              "font": "body_bold"},
@@ -1216,8 +1218,8 @@ class DamageApp(ctk.CTk):
             self.loot_note.configure(
                 text="Добыча не попадает в боевой журнал — её записывает аддон "
                      "AutoCombatLog. Нажмите «Установить автозапись журнала» на "
-                     "вкладке «Инфо», перезапустите игру: записи появятся после "
-                     "/reload или выхода из игры.")
+                     "вкладке «Инфо» (если аддон уже стоял — переустановите его, "
+                     "старая версия добычу не собирает), затем /reload в игре и F5.")
 
     def _class_tag(self, cls: str) -> str:
         tag = f"cls_{cls}" if cls else "cls_none"
