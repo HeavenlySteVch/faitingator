@@ -460,7 +460,7 @@ class DamageApp(ctk.CTk):
     def __init__(self, default_log: str | None = None):
         super().__init__()
         self.title("WoW Damage Parser — статистика заходов")
-        self.geometry("1460x920")
+        self.geometry("1180x760")
         self.minsize(1180, 760)
         self.configure(fg_color=APP_BG)
         self._set_window_icon()
@@ -816,6 +816,8 @@ class DamageApp(ctk.CTk):
     def _make_tree(self, parent, cols, heads, widths, num_from: int = 0) -> ttk.Treeview:
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True, padx=8, pady=(6, 8))
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
         tree = ttk.Treeview(frame, columns=cols, show="headings")
         for i, (c, h, w) in enumerate(zip(cols, heads, widths)):
             tree.heading(c, text=h)
@@ -823,10 +825,15 @@ class DamageApp(ctk.CTk):
             tree.column(c, width=w, anchor=anchor, stretch=(c in ("name", "ability")))
         tree.tag_configure("odd", background=ROW_ALT)
         tree.tag_configure("even", background=TABLE_BG)
-        tree.pack(fill="both", expand=True, side="left")
+        tree.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
+        sb.grid(row=0, column=1, sticky="ns")
+        # в узком окне широкие таблицы (характеристики) не влезают — нужна
+        # горизонтальная прокрутка, иначе последние столбцы просто не видно
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(xscrollcommand=hsb.set)
+        hsb.grid(row=1, column=0, sticky="ew")
         return tree
 
     # ------------------------------------------------------------------
